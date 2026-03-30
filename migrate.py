@@ -118,12 +118,16 @@ def main() -> None:
     try:
         discord_token = config.get_discord_bot_token()
         guild_id      = config.get_discord_guild_id()
-        slack_token   = config.get_slack_bot_token()
+        slack_token   = None if args.dry_run else config.get_slack_bot_token()
     except ValueError as e:
         logger.error("%s", e)
         sys.exit(1)
 
-    snapshot = fetch_server(discord_token, guild_id)
+    try:
+        snapshot = fetch_server(discord_token, guild_id)
+    except RuntimeError as e:
+        logger.error("%s", e)
+        sys.exit(1)
     plan     = build_mirror_plan(snapshot, guild_id)
 
     if not plan:

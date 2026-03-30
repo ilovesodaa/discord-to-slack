@@ -18,7 +18,7 @@ class ApplyResult(TypedDict):
     errors: list[str]
 
 
-def apply_plan(token: str, items: list[MirrorItem], dry_run: bool = False) -> ApplyResult:
+def apply_plan(token: str | None, items: list[MirrorItem], dry_run: bool = False) -> ApplyResult:
     """Create Slack channels from a list of MirrorItems.
 
     If dry_run is True, nothing is created — only the plan is printed.
@@ -28,6 +28,9 @@ def apply_plan(token: str, items: list[MirrorItem], dry_run: bool = False) -> Ap
     if dry_run:
         _print_plan(items)
         return result
+
+    if not token:
+        raise ValueError("SLACK_BOT_TOKEN is required for a live migration run.")
 
     client = WebClient(token=token)
 
