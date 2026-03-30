@@ -4,6 +4,7 @@ import logging
 from typing import Optional
 
 import requests
+from requests.exceptions import ConnectionError, HTTPError, Timeout
 
 from models import DiscordChannel, DiscordRole, ServerSnapshot
 
@@ -25,8 +26,19 @@ def _headers(token: str) -> dict[str, str]:
 
 def _get(token: str, path: str) -> list | dict:
     url = f"{DISCORD_API_BASE}{path}"
-    response = requests.get(url, headers=_headers(token), timeout=15)
-    response.raise_for_status()
+    try:
+        response = requests.get(url, headers=_headers(token), timeout=15)
+        response.raise_for_status()
+    except HTTPError as e:
+        status = e.response.status_code if e.response is not None else "unknown"
+        raise RuntimeError(
+            f"Discord API error {status} for {path}. "
+            "Check your DISCORD_BOT_TOKEN and DISCORD_GUILD_ID."
+        ) from e
+    except (ConnectionError, Timeout) as e:
+        raise RuntimeError(
+            f"Could not reach Discord API ({type(e).__name__}). Check your network connection."
+        ) from e
     return response.json()
 
 
