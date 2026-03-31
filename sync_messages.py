@@ -108,9 +108,13 @@ class MessageSyncBot:
         # - SLACK_CUSTOM_ICON_URL: URL to avatar image to use for posts
         self.slack_custom_username: Optional[str] = os.environ.get("SLACK_CUSTOM_USERNAME")
         self.slack_custom_icon_url: Optional[str] = os.environ.get("SLACK_CUSTOM_ICON_URL")
-        # slack_socket and http_session are created in run() — aiohttp.ClientSession requires a running event loop
+        # slack_socket, http_session, and cdn_session are created in run() —
+        # aiohttp.ClientSession requires a running event loop
         self.slack_socket: Optional[SocketModeClient] = None
         self.http_session: Optional[aiohttp.ClientSession] = None
+        # cdn_session has no default Authorization header so it can safely
+        # fetch CDN/S3 signed URLs that embed credentials in the URL itself.
+        self._cdn_session: Optional[aiohttp.ClientSession] = None
 
         # Track processed messages to avoid loops
         self.processed_messages: set[str] = set()
@@ -376,6 +380,64 @@ class MessageSyncBot:
         except SlackApiError as e:
             logger.error(f"Failed to send message to Slack: {e}")
 
+    async def _download_slack_file(self, url: str, max_bytes: int) -> Optional[bytes]:
+        """Download a Slack private file, handling CDN redirects correctly.
+
+        Slack private URLs require a Bearer token for the initial auth check but
+        then redirect to a CDN endpoint (e.g. S3) whose signed URL already
+        embeds access credentials.  Sending the Bearer ``Authorization`` header
+        to that CDN causes the CDN to return a small error response instead of
+        the real file.  We therefore disable auto-redirects on the first request
+        and follow any redirect with a plain session that carries no default
+        ``Authorization`` header.
+        """
+        try:
+            # Initial authenticated request to Slack — no auto-redirect so we
+            # can detect a CDN redirect before forwarding the auth header.
+            async with self.http_session.get(url, allow_redirects=False) as resp:
+                if resp.status in (301, 302, 303, 307, 308):
+                    cdn_url = resp.headers.get("Location")
+                    if not cdn_url:
+                        logger.warning("Redirect from %s has no Location header", url)
+                        return None
+                    # Follow the CDN URL without auth headers; the redirect URL
+                    # already embeds any necessary signed download token.
+                    cdn_session = self._cdn_session or aiohttp.ClientSession()
+                    async with cdn_session.get(cdn_url) as cdn_resp:
+                        return await self._read_response_bytes(cdn_resp, cdn_url, max_bytes)
+                else:
+                    return await self._read_response_bytes(resp, url, max_bytes)
+        except Exception as e:
+            logger.warning("Error downloading Slack file %s: %s", url, e)
+            return None
+
+    @staticmethod
+    async def _read_response_bytes(
+        resp: aiohttp.ClientResponse, url: str, max_bytes: int
+    ) -> Optional[bytes]:
+        """Read and size-check an HTTP response body."""
+        if resp.status != 200:
+            logger.warning("Failed to download file from %s: HTTP %s", url, resp.status)
+            return None
+        try:
+            content_length = int(resp.headers.get("Content-Length", 0) or 0)
+        except (ValueError, TypeError):
+            content_length = 0
+        if content_length and content_length > max_bytes:
+            logger.warning(
+                "Skipping file from %s: Content-Length %d exceeds %d-byte limit",
+                url, content_length, max_bytes,
+            )
+            return None
+        data = await resp.read()
+        if len(data) > max_bytes:
+            logger.warning(
+                "Skipping file from %s: downloaded size %d exceeds %d-byte limit",
+                url, len(data), max_bytes,
+            )
+            return None
+        return data
+
     async def _send_to_discord(
         self, channel_id: str, username: str, text: str, slack_ts: str,
         slack_files: Optional[list[dict]] = None,
@@ -416,22 +478,9 @@ class MessageSyncBot:
                     if reported_size and reported_size > _MAX_FILE_BYTES:
                         logger.warning("Skipping Slack file %s: size %d exceeds limit", filename, reported_size)
                         continue
-                    try:
-                        async with self.http_session.get(url) as resp:
-                            if resp.status == 200:
-                                content_length = int(resp.headers.get("Content-Length", 0) or 0)
-                                if content_length and content_length > _MAX_FILE_BYTES:
-                                    logger.warning("Skipping Slack file %s: Content-Length %d exceeds limit", filename, content_length)
-                                    continue
-                                data = await resp.read()
-                                if len(data) > _MAX_FILE_BYTES:
-                                    logger.warning("Skipping Slack file %s: downloaded size %d exceeds limit", filename, len(data))
-                                    continue
-                                discord_files.append(discord.File(io.BytesIO(data), filename=filename))
-                            else:
-                                logger.warning("Failed to download Slack file %s: HTTP %s", url, resp.status)
-                    except Exception as e:
-                        logger.warning("Error downloading Slack file %s: %s", url, e)
+                    data = await self._download_slack_file(url, _MAX_FILE_BYTES)
+                    if data:
+                        discord_files.append(discord.File(io.BytesIO(data), filename=filename))
 
             # Try to post via webhook so the message appears with the Slack
             # user's name and avatar instead of the bot's identity.
@@ -504,6 +553,9 @@ class MessageSyncBot:
         self.http_session = aiohttp.ClientSession(
             headers={"Authorization": f"Bearer {self.slack_bot_token}"}
         )
+        # Plain session without auth headers — used to follow CDN redirects
+        # whose signed URLs already embed access credentials.
+        self._cdn_session = aiohttp.ClientSession()
         self.slack_socket = SocketModeClient(
             app_token=self.slack_app_token,
             web_client=self.slack_client,
@@ -521,6 +573,8 @@ class MessageSyncBot:
             await self.discord_bot.start(self.discord_token)
         finally:
             await self.http_session.close()
+            if self._cdn_session:
+                await self._cdn_session.close()
 
 
 def main():
