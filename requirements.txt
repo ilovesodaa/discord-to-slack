@@ -1,3 +1,5 @@
 requests>=2.31
 slack_sdk>=3.27
 python-dotenv>=1.0
+discord.py>=2.3
+aiohttp>=3.9
