@@ -233,3 +233,7 @@ The bot will:
   4. Reinstall/restart the bot if necessary.
 
   Alternatively, you can disable requesting message content in `sync_messages.py` (set `intents.message_content = False`) but note that without message content the sync bot cannot read or forward message bodies.
+
+---
+
+*Claude was here. Hi! 🤖*
