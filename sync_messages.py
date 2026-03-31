@@ -14,7 +14,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import aiohttp
 import discord
@@ -38,6 +38,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+# Name used for the per-channel Discord webhooks we create/own.
+_WEBHOOK_NAME = "Slack Bridge"
 
 
 class ChannelMapping:
@@ -112,6 +115,12 @@ class MessageSyncBot:
         # Track processed messages to avoid loops
         self.processed_messages: set[str] = set()
 
+        # Per-channel webhook cache (Discord channel ID → Webhook).
+        # Webhooks let us post as the original Slack user (name + avatar).
+        self._webhook_cache: dict[str, discord.Webhook] = {}
+        # IDs of webhooks we own — used to suppress echo in on_message.
+        self._our_webhook_ids: set[int] = set()
+
     @staticmethod
     def _require_env(name: str) -> str:
         """Get required environment variable or raise error."""
@@ -129,11 +138,16 @@ class MessageSyncBot:
         @self.discord_bot.event
         async def on_ready():
             logger.info(f"Discord bot connected as {self.discord_bot.user}")
+            await self._preload_webhooks()
 
         @self.discord_bot.event
         async def on_message(message: discord.Message):
             # Ignore bot's own messages
             if message.author == self.discord_bot.user:
+                return
+
+            # Ignore messages posted by our own Slack Bridge webhooks
+            if message.webhook_id and message.webhook_id in self._our_webhook_ids:
                 return
 
             # Check if this message was already processed (from Slack)
@@ -215,6 +229,53 @@ class MessageSyncBot:
 
         return "\n".join(parts)
 
+    async def _preload_webhooks(self) -> None:
+        """Discover and cache any pre-existing Slack Bridge webhooks on startup.
+
+        This populates ``_our_webhook_ids`` before any messages arrive so that
+        webhook messages from a previous run are not echoed back to Slack.
+        """
+        for discord_channel_id in self.channel_mapping.discord_to_slack:
+            try:
+                channel = self.discord_bot.get_channel(int(discord_channel_id))
+                if not channel:
+                    channel = await self.discord_bot.fetch_channel(int(discord_channel_id))
+                wh = await self._find_existing_webhook(channel)
+                if wh:
+                    self._webhook_cache[discord_channel_id] = wh
+                    self._our_webhook_ids.add(wh.id)
+                    logger.info("Preloaded webhook id=%s for channel %s", wh.id, discord_channel_id)
+            except Exception as e:
+                logger.warning("Could not preload webhooks for channel %s: %s", discord_channel_id, e)
+
+    @staticmethod
+    async def _find_existing_webhook(channel: discord.TextChannel) -> Optional[discord.Webhook]:
+        """Return the first existing Slack Bridge webhook for *channel*, or ``None``."""
+        for wh in await channel.webhooks():
+            if wh.name == _WEBHOOK_NAME and wh.token:
+                return wh
+        return None
+
+    async def _get_or_create_webhook(self, channel: discord.TextChannel) -> discord.Webhook:
+        """Return the Slack Bridge webhook for *channel*, creating it if needed."""
+        channel_id = str(channel.id)
+        if channel_id in self._webhook_cache:
+            return self._webhook_cache[channel_id]
+
+        # Search existing webhooks first to avoid duplicates across restarts.
+        wh = await self._find_existing_webhook(channel)
+        if wh:
+            self._webhook_cache[channel_id] = wh
+            self._our_webhook_ids.add(wh.id)
+            return wh
+
+        # None found — create a new one.
+        wh = await channel.create_webhook(name=_WEBHOOK_NAME)
+        self._webhook_cache[channel_id] = wh
+        self._our_webhook_ids.add(wh.id)
+        logger.info("Created webhook id=%s for channel %s", wh.id, channel_id)
+        return wh
+
     def _setup_slack_handlers(self) -> None:
         """Set up Slack event handlers."""
 
@@ -270,17 +331,24 @@ class MessageSyncBot:
             logger.info("No mapping for Slack channel %s — skipping", channel_id)
             return
 
-        # Get username
+        # Get username and avatar
         try:
             user_info = await self.slack_client.users_info(user=user_id)
-            username = user_info["user"]["profile"].get("display_name") or user_info["user"]["name"]
+            profile = user_info["user"]["profile"]
+            username = profile.get("display_name") or user_info["user"]["name"]
+            avatar_url: Optional[str] = (
+                profile.get("image_512")
+                or profile.get("image_192")
+                or profile.get("image_72")
+            )
         except SlackApiError as e:
             logger.warning("Failed to get Slack user info for %s: %s", user_id, e)
             username = "Unknown User"
+            avatar_url = None
 
         logger.info("Forwarding Slack -> Discord: channel=%s user=%s files=%d", channel_id, username, len(files))
 
-        await self._send_to_discord(discord_channel_id, username, text, ts, slack_files=files)
+        await self._send_to_discord(discord_channel_id, username, text, ts, slack_files=files, avatar_url=avatar_url)
 
     async def _send_to_slack(
         self, channel_id: str, username: str, text: str, discord_msg_id: int, avatar_url: Optional[str] = None
@@ -311,8 +379,14 @@ class MessageSyncBot:
     async def _send_to_discord(
         self, channel_id: str, username: str, text: str, slack_ts: str,
         slack_files: Optional[list[dict]] = None,
+        avatar_url: Optional[str] = None,
     ) -> None:
-        """Send message to Discord channel, including any Slack file attachments."""
+        """Send a Slack message to Discord via a per-channel webhook.
+
+        Using a webhook (rather than the bot account) lets Discord display the
+        original Slack user's display name and profile picture natively.
+        Falls back to ``channel.send()`` if webhook creation is not possible.
+        """
         try:
             channel = self.discord_bot.get_channel(int(channel_id))
             if not channel:
@@ -324,8 +398,6 @@ class MessageSyncBot:
                 except discord.errors.DiscordException as e:
                     logger.error("Failed to fetch Discord channel %s: %s", channel_id, e)
                     return
-
-            formatted_text = f"**{username}** (Slack): {text}" if text else f"**{username}** (Slack):"
 
             # Download any Slack file attachments and re-upload them to Discord.
             # Discord's default max upload size is 25 MB.
@@ -361,7 +433,25 @@ class MessageSyncBot:
                     except Exception as e:
                         logger.warning("Error downloading Slack file %s: %s", url, e)
 
-            await channel.send(formatted_text, files=discord_files)
+            # Try to post via webhook so the message appears with the Slack
+            # user's name and avatar instead of the bot's identity.
+            try:
+                webhook = await self._get_or_create_webhook(channel)
+                send_kwargs: dict[str, Any] = {"username": username}
+                if avatar_url:
+                    send_kwargs["avatar_url"] = avatar_url
+                if text:
+                    send_kwargs["content"] = text
+                if discord_files:
+                    send_kwargs["files"] = discord_files
+                await webhook.send(**send_kwargs)
+            except discord.errors.Forbidden:
+                # Bot lacks Manage Webhooks — fall back to plain channel.send()
+                logger.warning(
+                    "No Manage Webhooks permission for channel %s; falling back to bot message", channel_id
+                )
+                formatted_text = f"**{username}** (Slack): {text}" if text else f"**{username}** (Slack):"
+                await channel.send(formatted_text, files=discord_files)
 
             self.processed_messages.add(f"slack_{slack_ts}")
             logger.info(f"Forwarded Slack message to Discord channel {channel_id}")
