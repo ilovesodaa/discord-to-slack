@@ -29,7 +29,7 @@ class MirrorItem:
 
 
 @dataclass
-class ServerSnapshot:
+class ServerSnapshot:  # 🤖 claudeSnapshot (get it?)
     roles: list[DiscordRole]
     categories: dict[str, str]   # channel_id → category name
     channels: list[DiscordChannel]

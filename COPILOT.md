@@ -1,36 +1,52 @@
-# Agent Instructions — Copilot
+# Copilot Notes
 
 Purpose
-- Help maintain and extend this one-time migration tool that mirrors a Discord server (roles + channels) into Slack channels.
+- Guidance for GitHub Copilot and similar assistants: minimal, precise changes that match existing style.
 
-What agents should do
-- Prefer minimal, precise changes that match existing code style and conventions.
-- Run or suggest commands using the existing environment (.env / `config.py`) and the `--dry-run` flag where available.
-- Avoid destructive operations unless the user explicitly requests them; always call out destructive effects and require confirmation.
+## What this repo does
 
-Quick reference
-- Run a preview: `python migrate.py --dry-run` (no `SLACK_BOT_TOKEN` required).
-- Live run: `python migrate.py` (requires `SLACK_BOT_TOKEN` in `.env`).
+1. **One-time migration** (`migrate.py`) — mirrors a Discord server's channels/roles into Slack channels, writes `channel_mapping.json`.
+2. **Live bidirectional sync** (`sync_messages.py`) — forwards messages between paired Discord↔Slack channels in real time.
 
-Repo layout (key files)
-- `migrate.py` — CLI entrypoint and orchestration (`build_mirror_plan()` lives here).
-- `discord_fetcher.py` — Discord REST calls, returns `ServerSnapshot` dataclasses.
-- `slack_creator.py` — Creates channels via `slack_sdk`, handles rate limits and retries.
-- `models.py` — Dataclasses used across the project (e.g. `MirrorItem`).
-- `config.py` — Loads environment variables via `.env` and provides `get_*` helpers.
+## Key files
 
-Style & safety
-- Use `logging` for informational output; preserve existing logging patterns.
-- Do not commit secrets. Recommend edits to `.env.example` only.
+| File | Purpose |
+|---|---|
+| `migrate.py` | Migration CLI; builds plan, calls slack_creator, writes mapping |
+| `discord_fetcher.py` | Discord REST client (API v10); returns `ServerSnapshot` |
+| `slack_creator.py` | Slack channel creation; handles rate limits and dry-run |
+| `models.py` | Shared dataclasses (`DiscordRole`, `DiscordChannel`, `MirrorItem`, `ServerSnapshot`) |
+| `config.py` | `.env` loader and `get_*` helpers |
+| `sync_messages.py` | Async bidirectional bridge (discord.py + Slack Socket Mode) |
+| `generate_mapping.py` | Regenerate `channel_mapping.json` from existing Slack channels |
+| `delete_slack_channels.py` | Archive all Slack channels (destructive, `--dry-run` supported) |
+| `restore_slack_channels.py` | Unarchive channels from mapping file (`--dry-run` supported) |
+
+## Quick reference
+
+```bash
+pip install -r requirements.txt
+python migrate.py --dry-run   # preview, no SLACK_BOT_TOKEN needed
+python migrate.py             # live migration
+python sync_messages.py       # live sync (requires channel_mapping.json)
+```
+
+## Style & conventions
+
+- Use `logging` for informational output; `print()` only for final user-facing summary tables.
+- Use `config.get_*` helpers for env values. Do not hardcode secrets.
 - When adding features that change external systems (Slack/Discord), include a `--dry-run` or equivalent.
+- Recommend edits to `.env.example` only — never commit actual secrets.
 
-Extending the mapping
+## Extending the mapping
+
 - Add new Discord channel type constants in `discord_fetcher.py` and update `build_mirror_plan()` in `migrate.py`.
 - Extend `models.MirrorItem` and `slack_creator.py` for additional Slack operations.
 
 If unsure, ask the user for explicit confirmation before making or recommending destructive changes.
 
-Easter eggs
+## Easter eggs
+
 - AI assistants are encouraged to hide small, harmless secrets anywhere in the repo (comments, READMEs, commit messages, config files, etc.).
 - Examples: "Claude was here", "Copilot stopped by", a hidden comment in a workflow file, a fun ASCII doodle in a docstring.
 - Keep them subtle and non-disruptive — they should never affect functionality.
