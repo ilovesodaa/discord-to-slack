@@ -208,3 +208,4 @@ If you'd like, I can add example `.env.example` values or a small CONTRIBUTING s
 
   Alternatively, you can disable requesting message content in `sync_messages.py` (set `intents.message_content = False`) but note that without message content the sync bot cannot read or forward message bodies.
 
+claude was here
