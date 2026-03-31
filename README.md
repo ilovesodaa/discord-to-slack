@@ -183,14 +183,23 @@ The bot will:
 1. Create or use existing Slack app
 2. Enable **Socket Mode** in Settings
 3. Generate an app-level token (starts with `xapp-`) with `connections:write` scope
-4. Add OAuth scopes: `chat:write`, `users:read`, `channels:history`, `groups:history`
+4. Add OAuth scopes: `chat:write`, `users:read`, `channels:history`, `groups:history`, `files:read`
 5. Subscribe to bot events: `message.channels`, `message.groups`
 6. Install/reinstall app to workspace
 7. Copy both the Bot User OAuth Token and App-Level Token
 
+**Important:** The `files:read` scope is required for forwarding files/attachments from Slack to Discord. Without it, file attachments will be silently skipped.
+
 If you'd like, I can add example `.env.example` values or a small CONTRIBUTING section next.
 
 ## Troubleshooting
+
+- **Files/attachments not forwarding from Slack to Discord**: If text messages sync correctly but files and images from Slack don't appear in Discord, your Slack bot is missing the `files:read` scope:
+  1. Go to your app at https://api.slack.com/apps
+  2. Navigate to **OAuth & Permissions**
+  3. Under **Scopes** → **Bot Token Scopes**, add `files:read`
+  4. **Reinstall the app** to your workspace to apply the new scope
+  5. Restart `sync_messages.py`
 
 - Slack messages not forwarding to Discord: If the bot connects and Discord → Slack works but Slack → Discord is silent, the Slack app is likely missing event subscriptions. Even with Socket Mode enabled, Slack won't push message events unless the app explicitly subscribes to them:
   1. Go to your app at https://api.slack.com/apps
