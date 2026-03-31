@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -124,6 +125,10 @@ class MessageSyncBot:
         self._webhook_cache: dict[str, discord.Webhook] = {}
         # IDs of webhooks we own — used to suppress echo in on_message.
         self._our_webhook_ids: set[int] = set()
+        # Our own Slack bot_id — used to suppress echo without blocking other apps.
+        self._self_bot_id: Optional[str] = None
+        # Slack user ID → display name cache (avoids repeated API calls).
+        self._slack_user_cache: dict[str, str] = {}
 
     @staticmethod
     def _require_env(name: str) -> str:
@@ -192,9 +197,91 @@ class MessageSyncBot:
             )
 
     @staticmethod
+    def _slack_to_discord_links(text: str) -> str:
+        """Convert Slack mrkdwn links to Discord-friendly format.
+
+        Slack encodes URLs as ``<url>`` or ``<url|label>``.  Without conversion,
+        the angle brackets suppress Discord's auto-embed.  This turns:
+        - ``<https://example.com>`` → ``https://example.com`` (Discord auto-embeds)
+        - ``<https://example.com|click here>`` → ``[click here](https://example.com)``
+
+        Channel mentions ``<#C123|general>`` become ``#general``.
+        User/special mentions (``<@U123>``, ``<!here>``) are left for the async
+        resolver or passed through as-is.
+        """
+        def _replace(m: re.Match) -> str:
+            inner = m.group(1)
+            # Channel mentions: <#C123|general> → #general
+            if inner.startswith("#"):
+                if "|" in inner:
+                    _, name = inner.split("|", 1)
+                    return f"#{name}"
+                return m.group(0)
+            # User mentions and special commands — leave for async resolver
+            if inner.startswith(("@", "!")):
+                return m.group(0)
+            if "|" in inner:
+                url, label = inner.split("|", 1)
+                return f"[{label}]({url})"
+            return inner
+
+        return re.sub(r"<([^>]+)>", _replace, text)
+
+    async def _resolve_slack_mentions(self, text: str) -> str:
+        """Resolve Slack ``<@UXXXX>`` user mentions to ``@display_name``.
+
+        Also converts broadcast mentions (``<!here>``, ``<!channel>``,
+        ``<!everyone>``) to their readable ``@here`` / ``@channel`` /
+        ``@everyone`` equivalents.  Results are cached so repeated pings
+        of the same user don't hammer the Slack API.
+        """
+        # Broadcast mentions
+        text = text.replace("<!here>", "@here")
+        text = text.replace("<!channel>", "@channel")
+        text = text.replace("<!everyone>", "@everyone")
+        # Also handle <!here|here> variant Slack sometimes sends
+        text = re.sub(r"<!here\|here>", "@here", text)
+        text = re.sub(r"<!channel\|channel>", "@channel", text)
+        text = re.sub(r"<!everyone\|everyone>", "@everyone", text)
+
+        # User mentions: <@U12345> or <@U12345|old_name>
+        user_ids = set(re.findall(r"<@(U[A-Z0-9]+)(?:\|[^>]*)?>", text))
+        for uid in user_ids:
+            if uid not in self._slack_user_cache:
+                try:
+                    info = await self.slack_client.users_info(user=uid)
+                    profile = info["user"]["profile"]
+                    name = profile.get("display_name") or info["user"]["name"]
+                    self._slack_user_cache[uid] = name
+                except SlackApiError:
+                    self._slack_user_cache[uid] = uid  # graceful fallback
+            # Replace both <@U123> and <@U123|old_name> forms
+            text = re.sub(rf"<@{uid}(?:\|[^>]*)?>", f"@{self._slack_user_cache[uid]}", text)
+        return text
+
+    @staticmethod
     def _slack_escape(text: str) -> str:
         """Escape Slack mrkdwn special characters in plain text segments."""
         return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("|", "&#124;")
+
+    @staticmethod
+    def _resolve_discord_mentions(message: discord.Message) -> str:
+        """Replace Discord mention tokens with readable @name text for Slack.
+
+        Discord encodes mentions as ``<@ID>``, ``<@!ID>`` (nick), ``<#ID>``
+        (channel), and ``<@&ID>`` (role).  We swap them out for human-readable
+        ``@DisplayName``, ``#channel-name``, and ``@RoleName`` so Slack users
+        can tell who was pinged.
+        """
+        text = message.content
+        for user in message.mentions:
+            text = text.replace(f"<@!{user.id}>", f"@{user.display_name}")
+            text = text.replace(f"<@{user.id}>", f"@{user.display_name}")
+        for channel in message.channel_mentions:
+            text = text.replace(f"<#{channel.id}>", f"#{channel.name}")
+        for role in message.role_mentions:
+            text = text.replace(f"<@&{role.id}>", f"@{role.name}")
+        return text
 
     def _format_discord_message(self, message: discord.Message) -> str:
         """Build the text to forward to Slack from a Discord message.
@@ -206,7 +293,7 @@ class MessageSyncBot:
         parts: list[str] = []
 
         if message.content:
-            parts.append(message.content)
+            parts.append(self._resolve_discord_mentions(message))
 
         # File and image attachments — forward their direct URLs so Slack can
         # unfurl them (unfurl_media is intentionally left enabled for these).
@@ -312,6 +399,7 @@ class MessageSyncBot:
 
         files: list[dict] = msg.get("files", [])
         attachments: list[dict] = msg.get("attachments", [])
+        blocks: list[dict] = msg.get("blocks", [])
         bot_id = msg.get("bot_id") or event.get("bot_id")
 
         # Any attachment that carries an image URL is worth forwarding —
@@ -321,18 +409,25 @@ class MessageSyncBot:
             if att.get("image_url") or att.get("thumb_url")
         ]
 
+        # Slack's GIF picker (and some apps) put images in blocks, not
+        # attachments.  Extract image URLs from image-type blocks.
+        block_image_urls: list[str] = []
+        for block in blocks:
+            if block.get("type") == "image" and block.get("image_url"):
+                block_image_urls.append(block["image_url"])
+
         logger.info(
             "Processing Slack message: channel=%s user=%s bot_id=%s subtype=%s "
-            "files=%d attachments=%d image_attachments=%d text=%r",
+            "files=%d attachments=%d image_attachments=%d block_images=%d text=%r",
             event.get("channel"), msg.get("user") or event.get("user"),
             bot_id, subtype, len(files), len(attachments), len(image_attachments),
-            msg.get("text"),
+            len(block_image_urls), msg.get("text"),
         )
 
-        # Filter: skip bot messages unless they carry image attachments worth forwarding.
-        # (Our own bridge bot never posts attachments so this won't cause loops.)
-        if bot_id and not image_attachments:
-            logger.info("Skipping: bot_id=%s with no image attachments", bot_id)
+        # Filter: skip messages from our own bridge bot to prevent echo loops.
+        # Other app/bot messages are forwarded normally.
+        if bot_id and bot_id == self._self_bot_id:
+            logger.info("Skipping: message from our own bot (bot_id=%s)", bot_id)
             return
 
         # Allow file_share, bot_message, and message_changed (for bot image posts).
@@ -352,7 +447,7 @@ class MessageSyncBot:
         user_id = msg.get("user") or event.get("user")
         ts = msg.get("ts") or event.get("ts")
 
-        if not all([channel_id, ts]) or (not text and not files and not image_attachments):
+        if not all([channel_id, ts]) or (not text and not files and not image_attachments and not block_image_urls):
             return
 
         # Check if this message was already processed (from Discord)
@@ -386,8 +481,8 @@ class MessageSyncBot:
             username = msg.get("username") or event.get("username") or "App"
 
         logger.info(
-            "Forwarding Slack -> Discord: channel=%s user=%s files=%d image_attachments=%d",
-            channel_id, username, len(files), len(image_attachments),
+            "Forwarding Slack -> Discord: channel=%s user=%s files=%d image_attachments=%d block_images=%d",
+            channel_id, username, len(files), len(image_attachments), len(block_image_urls),
         )
 
         await self._send_to_discord(
@@ -395,6 +490,7 @@ class MessageSyncBot:
             slack_files=files,
             slack_attachments=image_attachments,
             avatar_url=avatar_url,
+            block_image_urls=block_image_urls,
         )
 
     async def _send_to_slack(
@@ -501,6 +597,7 @@ class MessageSyncBot:
         slack_files: Optional[list[dict]] = None,
         slack_attachments: Optional[list[dict]] = None,
         avatar_url: Optional[str] = None,
+        block_image_urls: Optional[list[str]] = None,
     ) -> None:
         """Send a Slack message to Discord via a per-channel webhook.
 
@@ -562,8 +659,20 @@ class MessageSyncBot:
                 if img_url:
                     attachment_urls.append(img_url)
 
+            # Build Discord embeds for block images (GIF picker, etc.) so the
+            # image renders cleanly without a raw URL cluttering the message.
+            discord_embeds: list[discord.Embed] = []
+            for img_url in (block_image_urls or []):
+                discord_embeds.append(discord.Embed().set_image(url=img_url))
+
             # Build final content: original text + any attachment image URLs
-            content_parts = [p for p in [text] + attachment_urls if p]
+            # Resolve Slack user mentions and convert Slack-formatted URLs
+            # so they display properly on Discord.
+            converted_text = text
+            if converted_text:
+                converted_text = await self._resolve_slack_mentions(converted_text)
+                converted_text = self._slack_to_discord_links(converted_text)
+            content_parts = [p for p in [converted_text] + attachment_urls if p]
             discord_content = "\n".join(content_parts)
 
             # Try to post via webhook so the message appears with the Slack
@@ -577,6 +686,8 @@ class MessageSyncBot:
                     send_kwargs["content"] = discord_content
                 if discord_files:
                     send_kwargs["files"] = discord_files
+                if discord_embeds:
+                    send_kwargs["embeds"] = discord_embeds
                 await webhook.send(**send_kwargs)
             except discord.errors.Forbidden:
                 # Bot lacks Manage Webhooks — fall back to plain channel.send()
@@ -597,11 +708,12 @@ class MessageSyncBot:
         logger.info("=== Slack channel membership diagnostic ===")
         try:
             auth = await self.slack_client.auth_test()
+            self._self_bot_id = auth.get("bot_id")
             logger.info(
                 "Slack auth_test: user_id=%s team=%s bot_id=%s",
                 auth.get("user_id"),
                 auth.get("team"),
-                auth.get("bot_id"),
+                self._self_bot_id,
             )
         except SlackApiError as e:
             logger.warning("Slack auth_test failed: %s", e)
