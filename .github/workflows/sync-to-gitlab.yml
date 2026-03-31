@@ -2,6 +2,7 @@ name: Sync to GitLab
 # 🤖 beep boop, claude was here
 
 on:
+  workflow_dispatch:
   push:
     branches: ["**"]
     tags: ["**"]
@@ -15,8 +16,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Mirror to GitLab
+      - name: Mask token
+        shell: bash
         run: |
+          echo "::add-mask::${GITLAB_PAT}"
+        env:
+          GITLAB_PAT: ${{ secrets.GITLAB_PAT }}
+
+      - name: Mirror to GitLab
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote remove gitlab || true
           git remote add gitlab "https://oauth2:${GITLAB_PAT}@gitlab.com/${GITLAB_REPO}.git"
           git push gitlab --prune "+refs/heads/*:refs/heads/*" "+refs/tags/*:refs/tags/*"
         env:
