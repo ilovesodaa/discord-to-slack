@@ -212,7 +212,7 @@ class MessageSyncBot:
         # unfurl them (unfurl_media is intentionally left enabled for these).
         for attachment in message.attachments:
             parts.append(attachment.url)
-
+        # I dont think this works. Too Bad!
         # Rich embeds posted by bots (e.g. GitHub commit notifications).
         for embed in message.embeds:
             embed_parts: list[str] = []
