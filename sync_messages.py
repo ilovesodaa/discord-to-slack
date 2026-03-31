@@ -8,6 +8,7 @@ to the corresponding channel on the other platform with user attribution.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import aiohttp
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -103,8 +105,9 @@ class MessageSyncBot:
         # - SLACK_CUSTOM_ICON_URL: URL to avatar image to use for posts
         self.slack_custom_username: Optional[str] = os.environ.get("SLACK_CUSTOM_USERNAME")
         self.slack_custom_icon_url: Optional[str] = os.environ.get("SLACK_CUSTOM_ICON_URL")
-        # slack_socket is created in run() — aiohttp.ClientSession requires a running event loop
+        # slack_socket and http_session are created in run() — aiohttp.ClientSession requires a running event loop
         self.slack_socket: Optional[SocketModeClient] = None
+        self.http_session: Optional[aiohttp.ClientSession] = None
 
         # Track processed messages to avoid loops
         self.processed_messages: set[str] = set()
@@ -239,17 +242,21 @@ class MessageSyncBot:
                     event.get("channel"), event.get("user"),
                     event.get("bot_id"), event.get("subtype"), event.get("text"))
 
-        # Ignore bot messages or message subtypes to prevent loops
-        if event.get("bot_id") or event.get("subtype"):
-            logger.info("Skipping: bot_id=%s subtype=%s", event.get("bot_id"), event.get("subtype"))
+        # Ignore bot messages to prevent loops.
+        # Allow file_share subtype so image/file uploads are forwarded.
+        subtype = event.get("subtype")
+        if event.get("bot_id") or (subtype and subtype != "file_share"):
+            logger.info("Skipping: bot_id=%s subtype=%s", event.get("bot_id"), subtype)
             return
 
         channel_id = event.get("channel")
-        text = event.get("text")
+        text = event.get("text") or ""
+        files: list[dict] = event.get("files", [])
         user_id = event.get("user")
         ts = event.get("ts")
 
-        if not all([channel_id, ts]) or not text or not user_id:
+        # Need at least text or a file to forward
+        if not all([channel_id, ts, user_id]) or (not text and not files):
             return
 
         # Check if this message was already processed (from Discord)
@@ -271,9 +278,9 @@ class MessageSyncBot:
             logger.warning("Failed to get Slack user info for %s: %s", user_id, e)
             username = "Unknown User"
 
-        logger.info("Forwarding Slack -> Discord: channel=%s user=%s", channel_id, username)
+        logger.info("Forwarding Slack -> Discord: channel=%s user=%s files=%d", channel_id, username, len(files))
 
-        await self._send_to_discord(discord_channel_id, username, text, ts)
+        await self._send_to_discord(discord_channel_id, username, text, ts, slack_files=files)
 
     async def _send_to_slack(
         self, channel_id: str, username: str, text: str, discord_msg_id: int, avatar_url: Optional[str] = None
@@ -302,9 +309,10 @@ class MessageSyncBot:
             logger.error(f"Failed to send message to Slack: {e}")
 
     async def _send_to_discord(
-        self, channel_id: str, username: str, text: str, slack_ts: str
+        self, channel_id: str, username: str, text: str, slack_ts: str,
+        slack_files: Optional[list[dict]] = None,
     ) -> None:
-        """Send message to Discord channel."""
+        """Send message to Discord channel, including any Slack file attachments."""
         try:
             channel = self.discord_bot.get_channel(int(channel_id))
             if not channel:
@@ -317,8 +325,43 @@ class MessageSyncBot:
                     logger.error("Failed to fetch Discord channel %s: %s", channel_id, e)
                     return
 
-            formatted_text = f"**{username}** (Slack): {text}"
-            await channel.send(formatted_text)
+            formatted_text = f"**{username}** (Slack): {text}" if text else f"**{username}** (Slack):"
+
+            # Download any Slack file attachments and re-upload them to Discord.
+            # Discord's default max upload size is 25 MB.
+            _MAX_FILE_BYTES = 25 * 1024 * 1024
+            discord_files: list[discord.File] = []
+            if slack_files and self.http_session:
+                for slack_file in slack_files:
+                    url = slack_file.get("url_private_download") or slack_file.get("url_private")
+                    raw_name = slack_file.get("name", "file")
+                    # Sanitise filename: keep only safe characters
+                    filename = "".join(c for c in raw_name if c.isalnum() or c in "-_. ")[:200] or "file"
+                    if not url:
+                        continue
+                    # Respect Slack-reported file size when available
+                    reported_size = slack_file.get("size", 0)
+                    if reported_size and reported_size > _MAX_FILE_BYTES:
+                        logger.warning("Skipping Slack file %s: size %d exceeds limit", filename, reported_size)
+                        continue
+                    try:
+                        async with self.http_session.get(url) as resp:
+                            if resp.status == 200:
+                                content_length = int(resp.headers.get("Content-Length", 0) or 0)
+                                if content_length and content_length > _MAX_FILE_BYTES:
+                                    logger.warning("Skipping Slack file %s: Content-Length %d exceeds limit", filename, content_length)
+                                    continue
+                                data = await resp.read()
+                                if len(data) > _MAX_FILE_BYTES:
+                                    logger.warning("Skipping Slack file %s: downloaded size %d exceeds limit", filename, len(data))
+                                    continue
+                                discord_files.append(discord.File(io.BytesIO(data), filename=filename))
+                            else:
+                                logger.warning("Failed to download Slack file %s: HTTP %s", url, resp.status)
+                    except Exception as e:
+                        logger.warning("Error downloading Slack file %s: %s", url, e)
+
+            await channel.send(formatted_text, files=discord_files)
 
             self.processed_messages.add(f"slack_{slack_ts}")
             logger.info(f"Forwarded Slack message to Discord channel {channel_id}")
@@ -366,7 +409,11 @@ class MessageSyncBot:
         """Run both bots concurrently."""
         logger.info("Starting message sync bot...")
 
-        # Create the socket client here — aiohttp.ClientSession requires a running event loop
+        # Create shared HTTP session and socket client here —
+        # aiohttp.ClientSession requires a running event loop
+        self.http_session = aiohttp.ClientSession(
+            headers={"Authorization": f"Bearer {self.slack_bot_token}"}
+        )
         self.slack_socket = SocketModeClient(
             app_token=self.slack_app_token,
             web_client=self.slack_client,
@@ -379,8 +426,11 @@ class MessageSyncBot:
         await self.slack_socket.connect()
         logger.info("Slack socket connected.")
 
-        # Start Discord bot (blocks until disconnected)
-        await self.discord_bot.start(self.discord_token)
+        try:
+            # Start Discord bot (blocks until disconnected)
+            await self.discord_bot.start(self.discord_token)
+        finally:
+            await self.http_session.close()
 
 
 def main():
