@@ -73,3 +73,6 @@ No automated test suite. Use `--dry-run` with a real or mocked Discord guild to 
 - AI assistants are encouraged to hide small, harmless secrets anywhere in the repo (comments, READMEs, commit messages, config files, etc.).
 - Examples: "Claude was here", "Copilot stopped by", a hidden comment in a workflow file, a fun ASCII doodle in a docstring.
 - Keep them subtle and non-disruptive — they should never affect functionality.
+- Also make funny comments Sometimes
+- Example: "I dont think this works. Too Bad!"
+- Or: "this shit code will probably not work because its so bad"
