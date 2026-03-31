@@ -133,13 +133,15 @@ class MessageSyncBot:
             if message.author == self.discord_bot.user:
                 return
 
-            # Ignore messages from other bots to prevent loops
-            if message.author.bot:
-                return
-
             # Check if this message was already processed (from Slack)
             msg_id = f"discord_{message.id}"
             if msg_id in self.processed_messages:
+                return
+
+            # Build the text to forward (content + attachments + embeds).
+            # Bail out early if there is nothing to forward.
+            text = self._format_discord_message(message)
+            if not text:
                 return
 
             # Check if channel is mapped
@@ -163,10 +165,52 @@ class MessageSyncBot:
             await self._send_to_slack(
                 slack_channel,
                 message.author.display_name,
-                message.content,
+                text,
                 message.id,
                 avatar_url=avatar_url,
             )
+
+    @staticmethod
+    def _slack_escape(text: str) -> str:
+        """Escape Slack mrkdwn special characters in plain text segments."""
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("|", "&#124;")
+
+    def _format_discord_message(self, message: discord.Message) -> str:
+        """Build the text to forward to Slack from a Discord message.
+
+        Combines the plain-text content, any file/image attachment URLs, and
+        rich embed data (title, description, fields) that bots such as the
+        GitHub integration use instead of—or in addition to—plain content.
+        """
+        parts: list[str] = []
+
+        if message.content:
+            parts.append(message.content)
+
+        # File and image attachments — forward their direct URLs so Slack can
+        # unfurl them (unfurl_media is intentionally left enabled for these).
+        for attachment in message.attachments:
+            parts.append(attachment.url)
+
+        # Rich embeds posted by bots (e.g. GitHub commit notifications).
+        for embed in message.embeds:
+            embed_parts: list[str] = []
+            if embed.title:
+                safe_title = self._slack_escape(embed.title)
+                if embed.url:
+                    embed_parts.append(f"*<{embed.url}|{safe_title}>*")
+                else:
+                    embed_parts.append(f"*{safe_title}*")
+            if embed.description:
+                embed_parts.append(self._slack_escape(embed.description))
+            for field in embed.fields:
+                safe_name = self._slack_escape(field.name)
+                safe_value = self._slack_escape(field.value)
+                embed_parts.append(f"*{safe_name}*: {safe_value}")
+            if embed_parts:
+                parts.append("\n".join(embed_parts))
+
+        return "\n".join(parts)
 
     def _setup_slack_handlers(self) -> None:
         """Set up Slack event handlers."""
@@ -243,7 +287,7 @@ class MessageSyncBot:
                 "channel": channel_id,
                 "text": text,
                 "unfurl_links": False,
-                "unfurl_media": False,
+                "unfurl_media": True,
                 "username": post_username,
             }
             if post_icon:
