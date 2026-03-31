@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import re
 import sys
+from pathlib import Path
 
 import config
 from discord_fetcher import (
@@ -92,6 +94,7 @@ def build_mirror_plan(snapshot: ServerSnapshot, guild_id: str) -> list[MirrorIte
                 slack_name=raw_name,   # placeholder; deduplicated below
                 is_private=is_private,
                 purpose=channel.topic or "",
+                discord_channel_id=channel.id,  # Include Discord channel ID
             )
         )
 
@@ -149,6 +152,22 @@ def main() -> None:
             print("\nErrors:")
             for err in result["errors"]:
                 print(f"  • {err}")
+
+        # Save channel mappings to channel_mapping.json
+        if result["mappings"]:
+            mapping_file = Path(__file__).parent / "channel_mapping.json"
+            mapping_data = {"mappings": result["mappings"]}
+
+            with open(mapping_file, "w") as f:
+                json.dump(mapping_data, f, indent=2)
+
+            logger.info(
+                "Saved %d channel mappings to %s for use with sync_messages.py",
+                len(result["mappings"]),
+                mapping_file
+            )
+            print(f"\n✓ Channel mappings saved to {mapping_file.name}")
+            print("  You can now use sync_messages.py to sync messages between Discord and Slack.")
 
 
 if __name__ == "__main__":

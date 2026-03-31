@@ -1,4 +1,5 @@
 .env
+channel_mapping.json
 __pycache__/
 *.pyc
 *.pyo

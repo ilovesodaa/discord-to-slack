@@ -1,0 +1,14 @@
+{
+  "mappings": [
+    {
+      "discord_channel_id": "1234567890123456789",
+      "slack_channel_id": "C01234ABCDE",
+      "description": "Example: General chat channel"
+    },
+    {
+      "discord_channel_id": "9876543210987654321",
+      "slack_channel_id": "C09876ZYXWV",
+      "description": "Example: Announcements channel"
+    }
+  ]
+}
