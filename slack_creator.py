@@ -16,6 +16,7 @@ class ApplyResult(TypedDict):
     created: int
     skipped: int
     errors: list[str]
+    mappings: list[dict[str, str]]  # Discord channel ID -> Slack channel ID mappings
 
 
 def apply_plan(token: str | None, items: list[MirrorItem], dry_run: bool = False) -> ApplyResult:
@@ -23,7 +24,7 @@ def apply_plan(token: str | None, items: list[MirrorItem], dry_run: bool = False
 
     If dry_run is True, nothing is created — only the plan is printed.
     """
-    result: ApplyResult = {"created": 0, "skipped": 0, "errors": []}
+    result: ApplyResult = {"created": 0, "skipped": 0, "errors": [], "mappings": []}
 
     if dry_run:
         _print_plan(items)
@@ -56,6 +57,14 @@ def _create_channel(client: WebClient, item: MirrorItem, result: ApplyResult) ->
                 logger.warning("Could not set topic for #%s: %s", item.slack_name, e.response["error"])
 
         result["created"] += 1
+
+        # Store mapping if this is a Discord channel (not a role)
+        if item.discord_channel_id:
+            result["mappings"].append({
+                "discord_channel_id": item.discord_channel_id,
+                "slack_channel_id": channel_id,
+                "description": f"#{item.slack_name}"
+            })
 
     except SlackApiError as e:
         error_code = e.response["error"]

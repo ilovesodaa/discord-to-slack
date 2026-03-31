@@ -16,7 +16,7 @@ A migration and synchronization tool for Discord and Slack. It provides two main
 
 - Real-time bidirectional message forwarding between Discord and Slack
 - User attribution showing who sent each message and from which platform
-- Channel mapping configuration to link Discord ↔ Slack channels
+- **Automatic channel mapping** — Generated during migration, or manually configured
 - Prevents message loops using message tracking
 
 ## Requirements
@@ -76,11 +76,26 @@ Example output:
 
 ```
 Done.  Created: 42  Skipped: 0  Errors: 0
+
+✓ Channel mappings saved to channel_mapping.json
+  You can now use sync_messages.py to sync messages between Discord and Slack.
 ```
+
+The migration script automatically creates `channel_mapping.json` with Discord ↔ Slack channel ID mappings. This file is used by `sync_messages.py` for message forwarding.
 
 ### Live Message Sync
 
-1. Configure channel mappings:
+**Option 1: Use auto-generated mappings (recommended)**
+
+If you've already run `migrate.py`, the `channel_mapping.json` file is created automatically. Simply start the sync bot:
+
+```bash
+python sync_messages.py
+```
+
+**Option 2: Manual configuration**
+
+If you didn't use `migrate.py` or want to customize mappings:
 
 ```bash
 cp channel_mapping.json.example channel_mapping.json
@@ -105,7 +120,7 @@ The mapping file format:
 - **Discord:** Enable Developer Mode in Settings → Advanced, then right-click channel → Copy Channel ID
 - **Slack:** Click channel name → ⋮ → View channel details → Scroll to bottom for Channel ID
 
-2. Start the sync bot:
+**Running the sync bot:**
 
 ```bash
 python sync_messages.py

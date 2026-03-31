@@ -25,6 +25,7 @@ class MirrorItem:
     slack_name: str       # sanitized, ≤80 chars
     is_private: bool
     purpose: str          # becomes Slack channel topic
+    discord_channel_id: Optional[str] = None  # Discord channel ID for mapping (None for roles)
 
 
 @dataclass
