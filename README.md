@@ -164,35 +164,52 @@ The bot will:
 1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
 2. Create a new application
 3. Go to "Bot" section and create a bot
-4. **For migrate.py:** Enable "View Channels" permission
+4. **For migrate.py:** Enable the following permission:
+   - **View Channels** — to read channels and roles from the server
 5. **For sync_messages.py:**
-   - Enable "Message Content Intent" under Privileged Gateway Intents
-   - Add "Send Messages" and "Read Message History" permissions
+   - Under **Privileged Gateway Intents**, enable **Message Content Intent**
+   - Enable the following permissions:
+     - **Read Message History** — to see messages in channels
+     - **Send Messages** — to forward Slack messages into Discord as the bot
+     - **Manage Webhooks** — required to create per-channel "Slack Bridge" webhooks so that Slack users' names and avatars appear natively in Discord. Without this permission the bot falls back to plain bot messages.
 6. Copy the bot token
-7. Invite bot to your server using OAuth2 URL Generator with appropriate permissions
+7. Invite the bot to your server using the OAuth2 URL Generator:
+   - Under **OAuth2 → URL Generator**, select the `bot` scope
+   - Tick all the permissions listed above and copy the generated URL
 
 ### Slack App Setup
 
 **For migrate.py:**
 1. Go to [Slack API Apps](https://api.slack.com/apps)
-2. Create a new app
-3. Add OAuth scopes: `channels:manage`, `channels:write`, `groups:write`
-4. Install app to workspace and copy Bot User OAuth Token
+2. Create a new app (from scratch)
+3. Go to **OAuth & Permissions** and add the following **Bot Token Scopes**:
+   - `channels:manage` — create and archive public channels
+   - `channels:write` — modify public channel settings
+   - `groups:write` — create and modify private channels
+4. Install app to workspace and copy the **Bot User OAuth Token**
 
 **For sync_messages.py:**
-1. Create or use existing Slack app
-2. Enable **Socket Mode** in Settings
-3. Generate an app-level token (starts with `xapp-`) with `connections:write` scope
-4. Add OAuth scopes: `chat:write`, `users:read`, `channels:history`, `groups:history`, `files:read`
-5. Subscribe to bot events: `message.channels`, `message.groups`
-6. Install/reinstall app to workspace
-7. Copy both the Bot User OAuth Token and App-Level Token
-
-**Important:** The `files:read` scope is required for forwarding files/attachments from Slack to Discord. Without it, file attachments will be silently skipped.
-
-If you'd like, I can add example `.env.example` values or a small CONTRIBUTING section next.
+1. Create or use an existing Slack app
+2. Enable **Socket Mode** in Settings → Socket Mode
+3. Generate an **App-Level Token** (starts with `xapp-`) with the `connections:write` scope
+4. Go to **OAuth & Permissions** and add the following **Bot Token Scopes**:
+   - `chat:write` — post messages as the bot
+   - `users:read` — look up Slack user display names and avatars
+   - `channels:history` — read messages in public channels
+   - `groups:history` — read messages in private channels
+   - `files:read` — download files/attachments so they can be forwarded to Discord (**required for file forwarding**)
+5. Go to **Event Subscriptions**, turn it **On**, and subscribe to these bot events:
+   - `message.channels` — messages in public channels
+   - `message.groups` — messages in private channels
+6. Install/reinstall the app to your workspace
+7. Copy both the **Bot User OAuth Token** and the **App-Level Token**
 
 ## Troubleshooting
+
+- **Slack messages appear in Discord as the bot instead of with the original user's name**: The Discord bot is missing the **Manage Webhooks** permission. Without it, `sync_messages.py` cannot create the per-channel "Slack Bridge" webhooks used to post messages with Slack user names and avatars, and falls back to plain bot messages:
+  1. In the [Discord Developer Portal](https://discord.com/developers/applications), open your app
+  2. Under **OAuth2 → URL Generator**, regenerate the invite URL with the **Manage Webhooks** permission added
+  3. Use the new URL to re-invite / re-authorize the bot to your server
 
 - **Files/attachments not forwarding from Slack to Discord**: If text messages sync correctly but files and images from Slack don't appear in Discord, your Slack bot is missing the `files:read` scope:
   1. Go to your app at https://api.slack.com/apps
@@ -201,20 +218,18 @@ If you'd like, I can add example `.env.example` values or a small CONTRIBUTING s
   4. **Reinstall the app** to your workspace to apply the new scope
   5. Restart `sync_messages.py`
 
-- Slack messages not forwarding to Discord: If the bot connects and Discord → Slack works but Slack → Discord is silent, the Slack app is likely missing event subscriptions. Even with Socket Mode enabled, Slack won't push message events unless the app explicitly subscribes to them:
+- **Slack messages not forwarding to Discord**: If the bot connects and Discord → Slack works but Slack → Discord is silent, the Slack app is likely missing event subscriptions. Even with Socket Mode enabled, Slack won't push message events unless the app explicitly subscribes to them:
   1. Go to your app at https://api.slack.com/apps
   2. Open **Event Subscriptions** and make sure it is **On**
   3. Under **Subscribe to bot events**, add `message.channels` (public channels) and `message.groups` (private channels)
   4. Save changes and **reinstall the app** to your workspace
 
-- Voice support: This project does NOT support voice channels. If you see warnings like `PyNaCl is not installed` or `davey is not installed`, they pertain only to optional voice features and can be safely ignored.
+- **Voice support**: This project does NOT support voice channels. If you see warnings like `PyNaCl is not installed` or `davey is not installed`, they pertain only to optional voice features and can be safely ignored.
 
-- Privileged intents error: If you see an error mentioning "PrivilegedIntentsRequired" (example: "Shard ID None is requesting privileged intents"), enable the **Message Content Intent** for your bot in the Discord Developer Portal:
+- **Privileged intents error**: If you see an error mentioning "PrivilegedIntentsRequired" (example: "Shard ID None is requesting privileged intents"), enable the **Message Content Intent** for your bot in the Discord Developer Portal:
   1. Open your app in https://discord.com/developers/applications
   2. Go to **Bot** → **Privileged Gateway Intents**
   3. Enable **Message Content Intent** and save
   4. Reinstall/restart the bot if necessary.
 
   Alternatively, you can disable requesting message content in `sync_messages.py` (set `intents.message_content = False`) but note that without message content the sync bot cannot read or forward message bodies.
-
-claude was here
