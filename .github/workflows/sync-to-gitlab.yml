@@ -1,4 +1,5 @@
 name: Sync to GitLab
+# 🤖 beep boop, claude was here
 
 on:
   push:
