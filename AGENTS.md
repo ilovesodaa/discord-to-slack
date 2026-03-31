@@ -1,48 +1,32 @@
-# discord-to-slack — AI Agent Notes
+# Agent Notes
 
-## What this project does
-Migrates a Discord server's structure (roles, categories, text/announcement/forum channels) into a Slack workspace as channels.
+Purpose
+- Short guidance for assistant agents working on this repo: run, extend, and maintain the Discord→Slack migration tool safely and predictably.
 
-## Repository layout
-```
-migrate.py           # CLI entry-point and mapping/orchestration logic
-discord_fetcher.py   # Fetches guild structure from Discord API v10
-slack_creator.py     # Creates Slack channels via slack_sdk
-models.py            # Shared dataclasses
-config.py            # Reads .env / environment variables
-requirements.txt
-.env.example
-```
+Key points for agents
+- Prefer non-destructive operations and `--dry-run` workflows when interacting with live APIs.
+- Use `config.get_*` helpers for environment values and never hardcode secrets.
+- When making changes that affect Slack/Discord, clearly document the risk and require user confirmation.
 
-## Environment variables
-| Variable | Required for | Description |
-|---|---|---|
-| `DISCORD_BOT_TOKEN` | Always | Bot token for Discord API |
-| `DISCORD_GUILD_ID` | Always | ID of the Discord server to mirror |
-| `SLACK_BOT_TOKEN` | Live migration only | Bot token for Slack API |
+Quick run
+- Install: `pip install -r requirements.txt`
+- Preview: `python migrate.py --dry-run`
+- Execute: `python migrate.py` (requires `SLACK_BOT_TOKEN` set)
 
-## How to run
-```bash
-pip install -r requirements.txt
-cp .env.example .env        # edit with real tokens
+Important files
+- `migrate.py` — orchestrator and plan builder
+- `discord_fetcher.py` — Discord REST client and snapshot model
+- `slack_creator.py` — Slack Web API client wrappers and channel creation logic
+- `models.py` — dataclass definitions
+- `config.py` — `.env` loader and `get_*` helpers
 
-python migrate.py --dry-run  # preview — Slack token not needed
-python migrate.py            # execute migration
-```
+Conventions
+- Python 3.10+ features are used (annotations, `|` unions).
+- Use `logging` consistently; reserve `print()` for final user-facing summary tables.
 
-## Code conventions
-- Python 3.10+ (`from __future__ import annotations`, union types with `|`)
-- `logging` for all informational output; `print()` only for the final summary table
-- All public functions are type-annotated
-- HTTP errors from Discord are converted to `RuntimeError` with a clear message in `discord_fetcher._get()`
-- `SLACK_BOT_TOKEN` is loaded as `None` during `--dry-run` so that a missing Slack token never blocks a dry-run
+Adding channel types
+- Add constants in `discord_fetcher.py`, update `build_mirror_plan()` in `migrate.py`, and document changes in `README.md`.
 
-## Adding new channel types
-1. Add the type constant to `discord_fetcher.py` (e.g. `CHANNEL_TYPE_MEDIA = 16`)
-2. Import it in `migrate.py` and add it to the skip-list or include-list in `build_mirror_plan`
-3. Document it in the mapping table in `README.md`
-
-## Common pitfalls
-- Slack channel names must be ≤80 chars, lowercase, alphanumeric + hyphens only → handled by `_sanitize()`
-- Duplicate names across categories are resolved by `_deduplicate()` → `-2`, `-3`, …
-- The `deny` field in Discord permission overwrites is a string bitfield integer
+Safety notes
+- Slack channel names: lowercase, alphanumeric and hyphens, ≤80 chars — sanitised by `_sanitize()`.
+- Preserve existing rate-limit handling in `slack_creator.py` when adding retries.

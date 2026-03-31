@@ -10,7 +10,7 @@ A migration and synchronization tool for Discord and Slack. It provides two main
 - Mirrors text, announcement, and forum channels to Slack channels.
 - Converts roles into private channels named `#role-<name>` (non-`@everyone`).
 - Preserves channel topics and handles duplicate names automatically.
-- Skips voice/stage channels (not applicable to Slack).
+- Skips voice/stage channels — this tool does NOT support voice channels.
 
 **Message Sync Highlights**
 
@@ -189,3 +189,22 @@ The bot will:
 7. Copy both the Bot User OAuth Token and App-Level Token
 
 If you'd like, I can add example `.env.example` values or a small CONTRIBUTING section next.
+
+## Troubleshooting
+
+- Slack messages not forwarding to Discord: If the bot connects and Discord → Slack works but Slack → Discord is silent, the Slack app is likely missing event subscriptions. Even with Socket Mode enabled, Slack won't push message events unless the app explicitly subscribes to them:
+  1. Go to your app at https://api.slack.com/apps
+  2. Open **Event Subscriptions** and make sure it is **On**
+  3. Under **Subscribe to bot events**, add `message.channels` (public channels) and `message.groups` (private channels)
+  4. Save changes and **reinstall the app** to your workspace
+
+- Voice support: This project does NOT support voice channels. If you see warnings like `PyNaCl is not installed` or `davey is not installed`, they pertain only to optional voice features and can be safely ignored.
+
+- Privileged intents error: If you see an error mentioning "PrivilegedIntentsRequired" (example: "Shard ID None is requesting privileged intents"), enable the **Message Content Intent** for your bot in the Discord Developer Portal:
+  1. Open your app in https://discord.com/developers/applications
+  2. Go to **Bot** → **Privileged Gateway Intents**
+  3. Enable **Message Content Intent** and save
+  4. Reinstall/restart the bot if necessary.
+
+  Alternatively, you can disable requesting message content in `sync_messages.py` (set `intents.message_content = False`) but note that without message content the sync bot cannot read or forward message bodies.
+

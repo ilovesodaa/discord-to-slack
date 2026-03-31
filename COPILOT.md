@@ -1,40 +1,31 @@
-# discord-to-slack — GitHub Copilot Notes
+# Agent Instructions — Copilot
 
-## Project overview
-Python CLI that reads a Discord server's roles and channels via the Discord REST API (v10) and recreates the structure as Slack channels.
+Purpose
+- Help maintain and extend this one-time migration tool that mirrors a Discord server (roles + channels) into Slack channels.
 
-## File map
-| File | Responsibility |
-|---|---|
-| `migrate.py` | CLI entry-point, `build_mirror_plan()`, orchestration |
-| `discord_fetcher.py` | `fetch_server()` — REST calls to Discord, returns `ServerSnapshot` |
-| `slack_creator.py` | `apply_plan()` — creates channels in Slack, handles rate limits |
-| `models.py` | `DiscordRole`, `DiscordChannel`, `MirrorItem`, `ServerSnapshot` |
-| `config.py` | `get_discord_bot_token()`, `get_discord_guild_id()`, `get_slack_bot_token()` |
+What agents should do
+- Prefer minimal, precise changes that match existing code style and conventions.
+- Run or suggest commands using the existing environment (.env / `config.py`) and the `--dry-run` flag where available.
+- Avoid destructive operations unless the user explicitly requests them; always call out destructive effects and require confirmation.
 
-## Key behaviours
-- `--dry-run` flag: prints a plan table; **does not** require `SLACK_BOT_TOKEN`
-- Discord HTTP/network errors surface as `RuntimeError` with a user-friendly message (caught in `main()`)
-- Channel names: sanitised to `[a-z0-9-]`, max 80 chars, deduplicated with numeric suffixes
-- Voice/stage channels are skipped; categories become name prefixes
+Quick reference
+- Run a preview: `python migrate.py --dry-run` (no `SLACK_BOT_TOKEN` required).
+- Live run: `python migrate.py` (requires `SLACK_BOT_TOKEN` in `.env`).
 
-## Environment setup
-```
-DISCORD_BOT_TOKEN=...   # always required
-DISCORD_GUILD_ID=...    # always required
-SLACK_BOT_TOKEN=...     # required only for live migration (not --dry-run)
-```
+Repo layout (key files)
+- `migrate.py` — CLI entrypoint and orchestration (`build_mirror_plan()` lives here).
+- `discord_fetcher.py` — Discord REST calls, returns `ServerSnapshot` dataclasses.
+- `slack_creator.py` — Creates channels via `slack_sdk`, handles rate limits and retries.
+- `models.py` — Dataclasses used across the project (e.g. `MirrorItem`).
+- `config.py` — Loads environment variables via `.env` and provides `get_*` helpers.
 
-## Quick start
-```bash
-pip install -r requirements.txt
-cp .env.example .env
-# edit .env, then:
-python migrate.py --dry-run
-python migrate.py
-```
+Style & safety
+- Use `logging` for informational output; preserve existing logging patterns.
+- Do not commit secrets. Recommend edits to `.env.example` only.
+- When adding features that change external systems (Slack/Discord), include a `--dry-run` or equivalent.
 
-## Extending the mapping
-- New channel types: add constant to `discord_fetcher.py`, update skip/include logic in `migrate.py:build_mirror_plan()`
-- New Slack operations: extend `slack_creator.py` and `models.MirrorItem`
-- All public APIs are fully type-annotated (Python 3.10+ union syntax)
+Extending the mapping
+- Add new Discord channel type constants in `discord_fetcher.py` and update `build_mirror_plan()` in `migrate.py`.
+- Extend `models.MirrorItem` and `slack_creator.py` for additional Slack operations.
+
+If unsure, ask the user for explicit confirmation before making or recommending destructive changes.
