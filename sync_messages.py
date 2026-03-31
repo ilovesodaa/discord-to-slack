@@ -129,6 +129,11 @@ class MessageSyncBot:
         self._self_bot_id: Optional[str] = None
         # Slack user ID → display name cache (avoids repeated API calls).
         self._slack_user_cache: dict[str, str] = {}
+        # Bidirectional message-ID maps for cross-platform edits.
+        # Discord message ID → Slack ts (for editing Slack when Discord edits).
+        self._msg_map_d2s: dict[int, str] = {}
+        # Slack ts → Discord message ID (for editing Discord when Slack edits).
+        self._msg_map_s2d: dict[str, int] = {}
 
     @staticmethod
     def _require_env(name: str) -> str:
@@ -195,6 +200,33 @@ class MessageSyncBot:
                 message.id,
                 avatar_url=avatar_url,
             )
+
+        @self.discord_bot.event
+        async def on_message_edit(before: discord.Message, after: discord.Message):
+            # Only process if we forwarded the original message.
+            slack_ts = self._msg_map_d2s.get(after.id)
+            if not slack_ts:
+                return
+            # Skip if content didn't actually change (e.g. embed-only update).
+            if before.content == after.content:
+                return
+            slack_channel = self.channel_mapping.get_slack_channel(
+                str(after.channel.id)
+            )
+            if not slack_channel:
+                return
+            new_text = self._resolve_discord_mentions(after) if after.content else ""
+            if not new_text:
+                return
+            try:
+                await self.slack_client.chat_update(
+                    channel=slack_channel,
+                    ts=slack_ts,
+                    text=new_text,
+                )
+                logger.info("Edited Slack message ts=%s for Discord edit %s", slack_ts, after.id)
+            except SlackApiError as e:
+                logger.error("Failed to edit Slack message: %s", e)
 
     @staticmethod
     def _slack_to_discord_links(text: str) -> str:
@@ -437,10 +469,30 @@ class MessageSyncBot:
             logger.info("Skipping: unhandled subtype=%s", subtype)
             return
 
-        # message_changed with no image content is just an edit/pin/reaction update.
-        if subtype == "message_changed" and not image_attachments:
-            logger.info("Skipping: message_changed with no image attachments")
-            return
+        # message_changed: if we forwarded the original, edit it on Discord.
+        if subtype == "message_changed":
+            original_ts = msg.get("ts")
+            discord_msg_id = self._msg_map_s2d.get(original_ts) if original_ts else None
+            if discord_msg_id:
+                ch_id = event.get("channel")
+                d_ch_id = self.channel_mapping.get_discord_channel(ch_id) if ch_id else None
+                if d_ch_id:
+                    new_text = msg.get("text", "")
+                    if new_text:
+                        new_text = await self._resolve_slack_mentions(new_text)
+                        new_text = self._slack_to_discord_links(new_text)
+                    webhook = self._webhook_cache.get(d_ch_id)
+                    if webhook and new_text:
+                        try:
+                            await webhook.edit_message(discord_msg_id, content=new_text)
+                            logger.info("Edited Discord message %s for Slack edit ts=%s", discord_msg_id, original_ts)
+                        except discord.errors.DiscordException as e:
+                            logger.error("Failed to edit Discord message: %s", e)
+                return
+            # No mapping — if it has image attachments, forward as new; otherwise skip.
+            if not image_attachments:
+                logger.info("Skipping: message_changed with no mapping and no image attachments")
+                return
 
         channel_id = event.get("channel")
         text = msg.get("text") or ""
@@ -511,9 +563,13 @@ class MessageSyncBot:
             if post_icon:
                 kwargs["icon_url"] = post_icon
 
-            await self.slack_client.chat_postMessage(**kwargs)
+            result = await self.slack_client.chat_postMessage(**kwargs)
 
             self.processed_messages.add(f"discord_{discord_msg_id}")
+            # Track the mapping so Discord edits can update this Slack message.
+            slack_ts = result.get("ts")
+            if slack_ts:
+                self._msg_map_d2s[discord_msg_id] = slack_ts
             logger.info(f"Forwarded Discord message to Slack channel {channel_id}")
 
         except SlackApiError as e:
@@ -688,14 +744,19 @@ class MessageSyncBot:
                     send_kwargs["files"] = discord_files
                 if discord_embeds:
                     send_kwargs["embeds"] = discord_embeds
-                await webhook.send(**send_kwargs)
+                sent_msg = await webhook.send(wait=True, **send_kwargs)
+                # Track the mapping so Slack edits can update this Discord message.
+                if sent_msg:
+                    self._msg_map_s2d[slack_ts] = sent_msg.id
             except discord.errors.Forbidden:
                 # Bot lacks Manage Webhooks — fall back to plain channel.send()
                 logger.warning(
                     "No Manage Webhooks permission for channel %s; falling back to bot message", channel_id
                 )
                 formatted_text = f"**{username}** (Slack): {discord_content}" if discord_content else f"**{username}** (Slack):"
-                await channel.send(formatted_text, files=discord_files)
+                sent_msg = await channel.send(formatted_text, files=discord_files)
+                if sent_msg:
+                    self._msg_map_s2d[slack_ts] = sent_msg.id
 
             self.processed_messages.add(f"slack_{slack_ts}")
             logger.info(f"Forwarded Slack message to Discord channel {channel_id}")
