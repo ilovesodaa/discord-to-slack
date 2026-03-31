@@ -1,90 +1,73 @@
 # discord-to-slack
 
-One-time migration script that reads a Discord server's structure and mirrors it into a Slack workspace.
+A small migration helper that reads a Discord server's roles and channels and recreates them in a Slack workspace. It's intended for one-time migrations where you want to preserve channel names, topics, and privacy settings.
 
-## What it copies
+**Highlights**
 
-| Discord | Slack |
-|---|---|
-| Role (non-`@everyone`) | Private channel named `#role-<name>` |
-| Text / announcement / forum channel | Public channel |
-| Channel restricted from `@everyone` | Private channel |
-| Category | Prefix on child channel names (`#category-channel`) |
-| Voice / stage channel | Skipped |
-
-Channel topics are carried over. Duplicate names are resolved automatically (`-2`, `-3`, etc.).
+- Mirrors text, announcement, and forum channels to Slack channels.
+- Converts roles into private channels named `#role-<name>` (non-`@everyone`).
+- Preserves channel topics and handles duplicate names automatically.
+- Skips voice/stage channels (not applicable to Slack).
 
 ## Requirements
 
-- Python 3.10+
-- A Discord bot with **View Channels** permission in the target server
-- A Slack bot installed to the target workspace
+- Python 3.10 or newer
+- A Discord bot token with **View Channels** permission for the source guild
+- A Slack bot token with channel-management scopes for the destination workspace
 
-## Setup
+## Quick setup
 
-**1. Install dependencies**
+1. Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-**2. Create a Discord bot**
-
-1. Go to [discord.com/developers/applications](https://discord.com/developers/applications) and create a new application.
-2. Under **Bot**, enable the bot and copy the token.
-3. Under **OAuth2 → URL Generator**, select the `bot` scope and the `View Channels` permission, then invite it to your server.
-
-**3. Create a Slack bot**
-
-1. Go to [api.slack.com/apps](https://api.slack.com/apps) and create a new app (from scratch).
-2. Under **OAuth & Permissions**, add these bot token scopes:
-   - `channels:manage`
-   - `channels:write`
-   - `groups:write`
-3. Install the app to your workspace and copy the **Bot User OAuth Token**.
-
-**4. Configure environment**
+2. Copy the example env and fill values:
 
 ```bash
 cp .env.example .env
+# then edit .env and add tokens
 ```
 
-Fill in `.env`:
+Required environment variables in `.env`:
 
-```
-DISCORD_BOT_TOKEN=your_discord_bot_token
-DISCORD_GUILD_ID=your_server_id        # right-click server → Copy Server ID
-SLACK_BOT_TOKEN=xoxb-your-slack-token
-```
+- `DISCORD_BOT_TOKEN` — Discord bot token
+- `DISCORD_GUILD_ID` — Discord server (guild) ID
+- `SLACK_BOT_TOKEN` — Bot token for the Slack app (xoxb-...)
 
 ## Usage
 
-**Dry run** — preview what will be created without touching Slack:
+- Preview (dry run):
 
 ```bash
 python migrate.py --dry-run
 ```
 
-**Run the migration:**
+- Perform migration:
 
 ```bash
 python migrate.py
 ```
 
-Output:
+Example output:
 
 ```
 Done.  Created: 42  Skipped: 0  Errors: 0
 ```
 
-## Project structure
+## Files
 
-```
-discord-to-slack/
-├── migrate.py           # Entry point and mapping logic
-├── discord_fetcher.py   # Reads roles and channels from Discord REST API
-├── slack_creator.py     # Creates channels in Slack
-├── models.py            # Shared dataclasses
-├── config.py            # Loads tokens from .env
-└── requirements.txt
-```
+- `migrate.py` — Entry point and orchestration
+- `discord_fetcher.py` — Reads roles & channels from Discord
+- `slack_creator.py` — Creates channels and groups in Slack
+- `models.py` — Shared dataclasses used across modules
+- `config.py` — Loads configuration from environment
+
+## Notes
+
+- The tool resolves duplicate names by appending `-2`, `-3`, etc.
+- Channels restricted from `@everyone` are created as private channels in Slack.
+- Voice and stage channels are intentionally skipped.
+
+If you'd like, I can add example `.env.example` values or a small CONTRIBUTING section next.
