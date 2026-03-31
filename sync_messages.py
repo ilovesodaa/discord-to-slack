@@ -303,25 +303,56 @@ class MessageSyncBot:
 
     async def _handle_slack_message(self, event: dict) -> None:
         """Handle incoming Slack message."""
-        logger.info("Processing Slack message: channel=%s user=%s bot_id=%s subtype=%s text=%r",
-                    event.get("channel"), event.get("user"),
-                    event.get("bot_id"), event.get("subtype"), event.get("text"))
-
-        # Ignore bot messages to prevent loops.
-        # Allow file_share subtype so image/file uploads are forwarded.
         subtype = event.get("subtype")
-        if event.get("bot_id") or (subtype and subtype != "file_share"):
-            logger.info("Skipping: bot_id=%s subtype=%s", event.get("bot_id"), subtype)
+
+        # For message_changed events the actual content (text, files, attachments,
+        # bot_id, ts, user) lives inside event["message"], not at the top level.
+        # Normalise early so the rest of the method is subtype-agnostic.
+        msg = event.get("message", event) if subtype == "message_changed" else event
+
+        files: list[dict] = msg.get("files", [])
+        attachments: list[dict] = msg.get("attachments", [])
+        bot_id = msg.get("bot_id") or event.get("bot_id")
+
+        # Any attachment that carries an image URL is worth forwarding —
+        # this covers Giphy, Tenor, link unfurls with preview images, etc.
+        image_attachments = [
+            att for att in attachments
+            if att.get("image_url") or att.get("thumb_url")
+        ]
+
+        logger.info(
+            "Processing Slack message: channel=%s user=%s bot_id=%s subtype=%s "
+            "files=%d attachments=%d image_attachments=%d text=%r",
+            event.get("channel"), msg.get("user") or event.get("user"),
+            bot_id, subtype, len(files), len(attachments), len(image_attachments),
+            msg.get("text"),
+        )
+
+        # Filter: skip bot messages unless they carry image attachments worth forwarding.
+        # (Our own bridge bot never posts attachments so this won't cause loops.)
+        if bot_id and not image_attachments:
+            logger.info("Skipping: bot_id=%s with no image attachments", bot_id)
+            return
+
+        # Allow file_share, bot_message, and message_changed (for bot image posts).
+        # Skip everything else (message_deleted, channel_join, huddle, etc.).
+        allowed_subtypes = ("file_share", "bot_message", "message_changed")
+        if subtype and subtype not in allowed_subtypes:
+            logger.info("Skipping: unhandled subtype=%s", subtype)
+            return
+
+        # message_changed with no image content is just an edit/pin/reaction update.
+        if subtype == "message_changed" and not image_attachments:
+            logger.info("Skipping: message_changed with no image attachments")
             return
 
         channel_id = event.get("channel")
-        text = event.get("text") or ""
-        files: list[dict] = event.get("files", [])
-        user_id = event.get("user")
-        ts = event.get("ts")
+        text = msg.get("text") or ""
+        user_id = msg.get("user") or event.get("user")
+        ts = msg.get("ts") or event.get("ts")
 
-        # Need at least text or a file to forward
-        if not all([channel_id, ts, user_id]) or (not text and not files):
+        if not all([channel_id, ts]) or (not text and not files and not image_attachments):
             return
 
         # Check if this message was already processed (from Discord)
@@ -335,24 +366,36 @@ class MessageSyncBot:
             logger.info("No mapping for Slack channel %s — skipping", channel_id)
             return
 
-        # Get username and avatar
-        try:
-            user_info = await self.slack_client.users_info(user=user_id)
-            profile = user_info["user"]["profile"]
-            username = profile.get("display_name") or user_info["user"]["name"]
-            avatar_url: Optional[str] = (
-                profile.get("image_512")
-                or profile.get("image_192")
-                or profile.get("image_72")
-            )
-        except SlackApiError as e:
-            logger.warning("Failed to get Slack user info for %s: %s", user_id, e)
-            username = "Unknown User"
-            avatar_url = None
+        # Resolve display name and avatar.  Bot/app messages may have no user_id;
+        # fall back to the event's own username field (e.g. "Giphy", "GitHub").
+        avatar_url: Optional[str] = None
+        if user_id:
+            try:
+                user_info = await self.slack_client.users_info(user=user_id)
+                profile = user_info["user"]["profile"]
+                username = profile.get("display_name") or user_info["user"]["name"]
+                avatar_url = (
+                    profile.get("image_512")
+                    or profile.get("image_192")
+                    or profile.get("image_72")
+                )
+            except SlackApiError as e:
+                logger.warning("Failed to get Slack user info for %s: %s", user_id, e)
+                username = msg.get("username") or event.get("username") or "Unknown User"
+        else:
+            username = msg.get("username") or event.get("username") or "App"
 
-        logger.info("Forwarding Slack -> Discord: channel=%s user=%s files=%d", channel_id, username, len(files))
+        logger.info(
+            "Forwarding Slack -> Discord: channel=%s user=%s files=%d image_attachments=%d",
+            channel_id, username, len(files), len(image_attachments),
+        )
 
-        await self._send_to_discord(discord_channel_id, username, text, ts, slack_files=files, avatar_url=avatar_url)
+        await self._send_to_discord(
+            discord_channel_id, username, text, ts,
+            slack_files=files,
+            slack_attachments=image_attachments,
+            avatar_url=avatar_url,
+        )
 
     async def _send_to_slack(
         self, channel_id: str, username: str, text: str, discord_msg_id: int, avatar_url: Optional[str] = None
@@ -419,6 +462,21 @@ class MessageSyncBot:
         if resp.status != 200:
             logger.warning("Failed to download file from %s: HTTP %s", url, resp.status)
             return None
+        content_type = resp.headers.get("Content-Type", "")
+        # An HTML or JSON response is an error page, not the actual file.
+        # This happens when the bot token lacks files:read scope or the URL expired.
+        if content_type.startswith("text/html") or content_type.startswith("application/json"):
+            try:
+                preview = await resp.text(encoding="utf-8", errors="replace")
+            except Exception:
+                preview = "<unreadable>"
+            logger.warning(
+                "Skipping file from %s: got Content-Type %r instead of a file "
+                "(check bot token has files:read scope). Response preview: %.200s",
+                url, content_type, preview,
+            )
+            return None
+        logger.debug("Downloading from %s: Content-Type=%s", url, content_type)
         try:
             content_length = int(resp.headers.get("Content-Length", 0) or 0)
         except (ValueError, TypeError):
@@ -441,6 +499,7 @@ class MessageSyncBot:
     async def _send_to_discord(
         self, channel_id: str, username: str, text: str, slack_ts: str,
         slack_files: Optional[list[dict]] = None,
+        slack_attachments: Optional[list[dict]] = None,
         avatar_url: Optional[str] = None,
     ) -> None:
         """Send a Slack message to Discord via a per-channel webhook.
@@ -480,7 +539,32 @@ class MessageSyncBot:
                         continue
                     data = await self._download_slack_file(url, _MAX_FILE_BYTES)
                     if data:
+                        # Warn if the downloaded data is much smaller than Slack reports —
+                        # this indicates we fetched a thumbnail or error page instead of
+                        # the real file (e.g. missing files:read scope or CDN mismatch).
+                        if (
+                            reported_size
+                            and len(data) < reported_size * 0.5
+                            and (reported_size - len(data)) > 5120
+                        ):
+                            logger.warning(
+                                "Downloaded %d bytes for %r but Slack reports %d bytes — "
+                                "may be a thumbnail; check bot token scopes (files:read)",
+                                len(data), filename, reported_size,
+                            )
                         discord_files.append(discord.File(io.BytesIO(data), filename=filename))
+
+            # Extract image URLs from Slack attachments (Giphy, Tenor, link unfurls, etc.)
+            # and append them to the Discord message content so Discord auto-embeds them.
+            attachment_urls: list[str] = []
+            for att in (slack_attachments or []):
+                img_url = att.get("image_url") or att.get("thumb_url")
+                if img_url:
+                    attachment_urls.append(img_url)
+
+            # Build final content: original text + any attachment image URLs
+            content_parts = [p for p in [text] + attachment_urls if p]
+            discord_content = "\n".join(content_parts)
 
             # Try to post via webhook so the message appears with the Slack
             # user's name and avatar instead of the bot's identity.
@@ -489,8 +573,8 @@ class MessageSyncBot:
                 send_kwargs: dict[str, Any] = {"username": username}
                 if avatar_url:
                     send_kwargs["avatar_url"] = avatar_url
-                if text:
-                    send_kwargs["content"] = text
+                if discord_content:
+                    send_kwargs["content"] = discord_content
                 if discord_files:
                     send_kwargs["files"] = discord_files
                 await webhook.send(**send_kwargs)
@@ -499,7 +583,7 @@ class MessageSyncBot:
                 logger.warning(
                     "No Manage Webhooks permission for channel %s; falling back to bot message", channel_id
                 )
-                formatted_text = f"**{username}** (Slack): {text}" if text else f"**{username}** (Slack):"
+                formatted_text = f"**{username}** (Slack): {discord_content}" if discord_content else f"**{username}** (Slack):"
                 await channel.send(formatted_text, files=discord_files)
 
             self.processed_messages.add(f"slack_{slack_ts}")
