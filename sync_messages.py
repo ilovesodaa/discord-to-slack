@@ -134,8 +134,6 @@ class MessageSyncBot:
         self._msg_map_d2s: dict[int, str] = {}
         # Slack ts → Discord message ID (for editing Discord when Slack edits).
         self._msg_map_s2d: dict[str, int] = {}
-        # Discord parent message ID → Discord thread ID (cache to avoid duplicate threads).
-        self._discord_thread_map: dict[int, int] = {}
         # Persist message maps across restarts so thread replies still resolve.
         self._msg_map_path = Path(__file__).parent / "message_map.json"
         self._load_msg_maps()
@@ -433,24 +431,6 @@ class MessageSyncBot:
         logger.info("Created webhook id=%s for channel %s", wh.id, channel_id)
         return wh
 
-    async def _get_or_create_discord_thread(
-        self, discord_channel_id: str, parent_msg_id: int
-    ) -> Optional[int]:
-        """Return the Discord thread ID for *parent_msg_id*, creating it if needed."""
-        if parent_msg_id in self._discord_thread_map:
-            return self._discord_thread_map[parent_msg_id]
-        try:
-            channel = self.discord_bot.get_channel(int(discord_channel_id))
-            if not channel:
-                channel = await self.discord_bot.fetch_channel(int(discord_channel_id))
-            parent_msg = await channel.fetch_message(parent_msg_id)
-            thread = parent_msg.thread or await parent_msg.create_thread(name="Thread")
-            self._discord_thread_map[parent_msg_id] = thread.id
-            return thread.id
-        except discord.errors.DiscordException as e:
-            logger.error("Failed to get/create Discord thread for msg %s: %s", parent_msg_id, e)
-            return None
-
     def _setup_slack_handlers(self) -> None:
         """Set up Slack event handlers."""
 
@@ -590,15 +570,11 @@ class MessageSyncBot:
             channel_id, username, len(files), len(image_attachments), len(block_image_urls),
         )
 
-        # If this is a Slack thread reply, post it into the corresponding Discord thread.
-        discord_thread_id: Optional[int] = None
+        # If this is a Slack thread reply, find the parent Discord message to reply to.
+        discord_reply_to_id: Optional[int] = None
         is_reply = slack_thread_ts and slack_thread_ts != ts
         if is_reply:
-            parent_discord_msg_id = self._msg_map_s2d.get(slack_thread_ts)
-            if parent_discord_msg_id:
-                discord_thread_id = await self._get_or_create_discord_thread(
-                    discord_channel_id, parent_discord_msg_id
-                )
+            discord_reply_to_id = self._msg_map_s2d.get(slack_thread_ts)
 
         await self._send_to_discord(
             discord_channel_id, username, text, ts,
@@ -606,7 +582,7 @@ class MessageSyncBot:
             slack_attachments=image_attachments,
             avatar_url=avatar_url,
             block_image_urls=block_image_urls,
-            discord_thread_id=discord_thread_id,
+            discord_reply_to_id=discord_reply_to_id,
         )
 
     async def _send_to_slack(
@@ -722,7 +698,7 @@ class MessageSyncBot:
         slack_attachments: Optional[list[dict]] = None,
         avatar_url: Optional[str] = None,
         block_image_urls: Optional[list[str]] = None,
-        discord_thread_id: Optional[int] = None,
+        discord_reply_to_id: Optional[int] = None,
     ) -> None:
         """Send a Slack message to Discord via a per-channel webhook.
 
@@ -802,34 +778,49 @@ class MessageSyncBot:
 
             # Try to post via webhook so the message appears with the Slack
             # user's name and avatar instead of the bot's identity.
-            try:
-                webhook = await self._get_or_create_webhook(channel)
-                send_kwargs: dict[str, Any] = {"username": username}
-                if avatar_url:
-                    send_kwargs["avatar_url"] = avatar_url
-                if discord_content:
-                    send_kwargs["content"] = discord_content
-                if discord_files:
-                    send_kwargs["files"] = discord_files
-                if discord_embeds:
-                    send_kwargs["embeds"] = discord_embeds
-                if discord_thread_id:
-                    send_kwargs["thread"] = discord.Object(id=discord_thread_id)
-                sent_msg = await webhook.send(wait=True, **send_kwargs)
-                # Track the mapping so Slack edits can update this Discord message.
-                if sent_msg:
-                    self._msg_map_s2d[slack_ts] = sent_msg.id
-                    self._save_msg_maps()
-            except discord.errors.Forbidden:
-                # Bot lacks Manage Webhooks — fall back to plain channel.send()
-                logger.warning(
-                    "No Manage Webhooks permission for channel %s; falling back to bot message", channel_id
+            # For replies, webhooks don't support message references, so we use
+            # channel.send() with a reference to show the "↩ replying to" indicator.
+            if discord_reply_to_id:
+                ref = discord.MessageReference(
+                    message_id=discord_reply_to_id,
+                    channel_id=int(channel_id),
+                    fail_if_not_exists=False,
                 )
-                formatted_text = f"**{username}** (Slack): {discord_content}" if discord_content else f"**{username}** (Slack):"
-                sent_msg = await channel.send(formatted_text, files=discord_files)
+                reply_text = f"**{username}**: {discord_content}" if discord_content else f"**{username}**"
+                sent_msg = await channel.send(reply_text, reference=ref, files=discord_files)
                 if sent_msg:
                     self._msg_map_s2d[slack_ts] = sent_msg.id
+                    self._msg_map_d2s[sent_msg.id] = slack_ts
                     self._save_msg_maps()
+            else:
+                try:
+                    webhook = await self._get_or_create_webhook(channel)
+                    send_kwargs: dict[str, Any] = {"username": username}
+                    if avatar_url:
+                        send_kwargs["avatar_url"] = avatar_url
+                    if discord_content:
+                        send_kwargs["content"] = discord_content
+                    if discord_files:
+                        send_kwargs["files"] = discord_files
+                    if discord_embeds:
+                        send_kwargs["embeds"] = discord_embeds
+                    sent_msg = await webhook.send(wait=True, **send_kwargs)
+                    # Track the mapping so Slack edits can update this Discord message.
+                    if sent_msg:
+                        self._msg_map_s2d[slack_ts] = sent_msg.id
+                        self._msg_map_d2s[sent_msg.id] = slack_ts
+                        self._save_msg_maps()
+                except discord.errors.Forbidden:
+                    # Bot lacks Manage Webhooks — fall back to plain channel.send()
+                    logger.warning(
+                        "No Manage Webhooks permission for channel %s; falling back to bot message", channel_id
+                    )
+                    formatted_text = f"**{username}** (Slack): {discord_content}" if discord_content else f"**{username}** (Slack):"
+                    sent_msg = await channel.send(formatted_text, files=discord_files)
+                    if sent_msg:
+                        self._msg_map_s2d[slack_ts] = sent_msg.id
+                        self._msg_map_d2s[sent_msg.id] = slack_ts
+                        self._save_msg_maps()
 
             self.processed_messages.add(f"slack_{slack_ts}")
             logger.info(f"Forwarded Slack message to Discord channel {channel_id}")
