@@ -1,5 +1,6 @@
 .env
 channel_mapping.json
+message_map.json
 __pycache__/
 *.pyc
 *.pyo

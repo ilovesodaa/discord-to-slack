@@ -136,6 +136,9 @@ class MessageSyncBot:
         self._msg_map_s2d: dict[str, int] = {}
         # Discord parent message ID → Discord thread ID (cache to avoid duplicate threads).
         self._discord_thread_map: dict[int, int] = {}
+        # Persist message maps across restarts so thread replies still resolve.
+        self._msg_map_path = Path(__file__).parent / "message_map.json"
+        self._load_msg_maps()
 
     @staticmethod
     def _require_env(name: str) -> str:
@@ -147,6 +150,32 @@ class MessageSyncBot:
                 f"Copy .env.example to .env and fill in your tokens."
             )
         return value
+
+    def _load_msg_maps(self) -> None:
+        """Load persisted message ID maps from disk."""
+        if not self._msg_map_path.exists():
+            return
+        try:
+            data = json.loads(self._msg_map_path.read_text())
+            self._msg_map_d2s = {int(k): v for k, v in data.get("d2s", {}).items()}
+            self._msg_map_s2d = data.get("s2d", {})
+            logger.info(
+                "Loaded %d d→s and %d s→d message mappings from disk",
+                len(self._msg_map_d2s), len(self._msg_map_s2d),
+            )
+        except Exception as e:
+            logger.warning("Failed to load message maps: %s", e)
+
+    def _save_msg_maps(self) -> None:
+        """Persist message ID maps so thread/edit cross-references survive restarts."""
+        try:
+            data = {
+                "d2s": {str(k): v for k, v in self._msg_map_d2s.items()},
+                "s2d": self._msg_map_s2d,
+            }
+            self._msg_map_path.write_text(json.dumps(data))
+        except Exception as e:
+            logger.warning("Failed to save message maps: %s", e)
 
     def _setup_discord_handlers(self) -> None:
         """Set up Discord event handlers."""
@@ -608,6 +637,7 @@ class MessageSyncBot:
             slack_ts = result.get("ts")
             if slack_ts:
                 self._msg_map_d2s[discord_msg_id] = slack_ts
+                self._save_msg_maps()
             logger.info(f"Forwarded Discord message to Slack channel {channel_id}")
 
         except SlackApiError as e:
@@ -784,11 +814,12 @@ class MessageSyncBot:
                 if discord_embeds:
                     send_kwargs["embeds"] = discord_embeds
                 if discord_thread_id:
-                    send_kwargs["thread_id"] = discord_thread_id
+                    send_kwargs["thread"] = discord.Object(id=discord_thread_id)
                 sent_msg = await webhook.send(wait=True, **send_kwargs)
                 # Track the mapping so Slack edits can update this Discord message.
                 if sent_msg:
                     self._msg_map_s2d[slack_ts] = sent_msg.id
+                    self._save_msg_maps()
             except discord.errors.Forbidden:
                 # Bot lacks Manage Webhooks — fall back to plain channel.send()
                 logger.warning(
@@ -798,6 +829,7 @@ class MessageSyncBot:
                 sent_msg = await channel.send(formatted_text, files=discord_files)
                 if sent_msg:
                     self._msg_map_s2d[slack_ts] = sent_msg.id
+                    self._save_msg_maps()
 
             self.processed_messages.add(f"slack_{slack_ts}")
             logger.info(f"Forwarded Slack message to Discord channel {channel_id}")
