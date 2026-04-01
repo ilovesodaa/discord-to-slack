@@ -134,6 +134,8 @@ class MessageSyncBot:
         self._msg_map_d2s: dict[int, str] = {}
         # Slack ts → Discord message ID (for editing Discord when Slack edits).
         self._msg_map_s2d: dict[str, int] = {}
+        # Discord parent message ID → Discord thread ID (cache to avoid duplicate threads).
+        self._discord_thread_map: dict[int, int] = {}
 
     @staticmethod
     def _require_env(name: str) -> str:
@@ -199,6 +201,9 @@ class MessageSyncBot:
                 text,
                 message.id,
                 avatar_url=avatar_url,
+                thread_ts=self._msg_map_d2s.get(message.reference.message_id)
+                if message.reference and message.reference.message_id
+                else None,
             )
 
         @self.discord_bot.event
@@ -399,6 +404,24 @@ class MessageSyncBot:
         logger.info("Created webhook id=%s for channel %s", wh.id, channel_id)
         return wh
 
+    async def _get_or_create_discord_thread(
+        self, discord_channel_id: str, parent_msg_id: int
+    ) -> Optional[int]:
+        """Return the Discord thread ID for *parent_msg_id*, creating it if needed."""
+        if parent_msg_id in self._discord_thread_map:
+            return self._discord_thread_map[parent_msg_id]
+        try:
+            channel = self.discord_bot.get_channel(int(discord_channel_id))
+            if not channel:
+                channel = await self.discord_bot.fetch_channel(int(discord_channel_id))
+            parent_msg = await channel.fetch_message(parent_msg_id)
+            thread = parent_msg.thread or await parent_msg.create_thread(name="Thread")
+            self._discord_thread_map[parent_msg_id] = thread.id
+            return thread.id
+        except discord.errors.DiscordException as e:
+            logger.error("Failed to get/create Discord thread for msg %s: %s", parent_msg_id, e)
+            return None
+
     def _setup_slack_handlers(self) -> None:
         """Set up Slack event handlers."""
 
@@ -498,6 +521,7 @@ class MessageSyncBot:
         text = msg.get("text") or ""
         user_id = msg.get("user") or event.get("user")
         ts = msg.get("ts") or event.get("ts")
+        slack_thread_ts = msg.get("thread_ts") or event.get("thread_ts")
 
         if not all([channel_id, ts]) or (not text and not files and not image_attachments and not block_image_urls):
             return
@@ -537,16 +561,28 @@ class MessageSyncBot:
             channel_id, username, len(files), len(image_attachments), len(block_image_urls),
         )
 
+        # If this is a Slack thread reply, post it into the corresponding Discord thread.
+        discord_thread_id: Optional[int] = None
+        is_reply = slack_thread_ts and slack_thread_ts != ts
+        if is_reply:
+            parent_discord_msg_id = self._msg_map_s2d.get(slack_thread_ts)
+            if parent_discord_msg_id:
+                discord_thread_id = await self._get_or_create_discord_thread(
+                    discord_channel_id, parent_discord_msg_id
+                )
+
         await self._send_to_discord(
             discord_channel_id, username, text, ts,
             slack_files=files,
             slack_attachments=image_attachments,
             avatar_url=avatar_url,
             block_image_urls=block_image_urls,
+            discord_thread_id=discord_thread_id,
         )
 
     async def _send_to_slack(
-        self, channel_id: str, username: str, text: str, discord_msg_id: int, avatar_url: Optional[str] = None
+        self, channel_id: str, username: str, text: str, discord_msg_id: int,
+        avatar_url: Optional[str] = None, thread_ts: Optional[str] = None,
     ) -> None:
         """Send message to Slack channel."""
         try:
@@ -562,6 +598,8 @@ class MessageSyncBot:
             }
             if post_icon:
                 kwargs["icon_url"] = post_icon
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
 
             result = await self.slack_client.chat_postMessage(**kwargs)
 
@@ -654,6 +692,7 @@ class MessageSyncBot:
         slack_attachments: Optional[list[dict]] = None,
         avatar_url: Optional[str] = None,
         block_image_urls: Optional[list[str]] = None,
+        discord_thread_id: Optional[int] = None,
     ) -> None:
         """Send a Slack message to Discord via a per-channel webhook.
 
@@ -744,6 +783,8 @@ class MessageSyncBot:
                     send_kwargs["files"] = discord_files
                 if discord_embeds:
                     send_kwargs["embeds"] = discord_embeds
+                if discord_thread_id:
+                    send_kwargs["thread_id"] = discord_thread_id
                 sent_msg = await webhook.send(wait=True, **send_kwargs)
                 # Track the mapping so Slack edits can update this Discord message.
                 if sent_msg:
