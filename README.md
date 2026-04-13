@@ -172,6 +172,8 @@ Similarly, when a reaction is added to a mapped message in Discord, a thread rep
 - Only reactions on messages that were forwarded by the bridge are announced (the message must exist in the cross-platform message map).
 - Reaction counts are not synced; each new reaction generates a separate announcement reply.
 - Reaction removal is not tracked.
+- Emoji names from Slack (e.g. `:thumbsup:`) are announced as-is; most Discord clients render standard emoji names as actual emoji, but custom workspace emoji will appear as plain text (e.g. `:custom-emoji:`).
+- Usernames in the announcement (e.g. `@alice`) are display names, not clickable mentions. Creating real cross-platform mentions is not possible without a Discord↔Slack user ID mapping table.
 - The feature can be disabled by setting `SYNC_REACTIONS=false` in your `.env`.
 
 To enable Slack → Discord reaction sync, subscribe to the `reaction_added` Slack bot event (see Slack App Setup above).
