@@ -18,6 +18,7 @@ A migration and synchronization tool for Discord and Slack. It provides two main
 - User attribution showing who sent each message and from which platform
 - **Automatic channel mapping** — Generated during migration, or manually configured
 - Prevents message loops using message tracking
+- **Reaction sync** — reactions on either platform are announced as thread replies on the other platform
 
 ## Requirements
 
@@ -157,6 +158,24 @@ The bot will:
 - The sync is real-time and runs continuously until stopped (Ctrl+C)
 - Message history is not synced, only new messages after the bot starts
 
+**Reaction Sync:**
+
+When a reaction is added to a message in Slack, a thread reply is posted in the corresponding Discord channel:
+
+> `:thumbsup: reaction added by @alice`
+
+Similarly, when a reaction is added to a mapped message in Discord, a thread reply is posted in the corresponding Slack thread:
+
+> `👍 reaction added by @Bob`
+
+**Limitations:**
+- Only reactions on messages that were forwarded by the bridge are announced (the message must exist in the cross-platform message map).
+- Reaction counts are not synced; each new reaction generates a separate announcement reply.
+- Reaction removal is not tracked.
+- The feature can be disabled by setting `SYNC_REACTIONS=false` in your `.env`.
+
+To enable Slack → Discord reaction sync, subscribe to the `reaction_added` Slack bot event (see Slack App Setup above).
+
 ## Setup Guide
 
 ### Discord Bot Setup
@@ -201,6 +220,7 @@ The bot will:
 5. Go to **Event Subscriptions**, turn it **On**, and subscribe to these bot events:
    - `message.channels` — messages in public channels
    - `message.groups` — messages in private channels
+   - `reaction_added` — reactions added to messages (required for reaction sync)
 6. Install/reinstall the app to your workspace
 7. Copy both the **Bot User OAuth Token** and the **App-Level Token**
 

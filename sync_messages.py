@@ -96,9 +96,14 @@ class MessageSyncBot:
         self.channel_mapping = ChannelMapping(mapping_path)
 
         # Initialize Discord bot
+        # Reaction sync: set to False to disable reaction announcements entirely.
+        sync_reactions_env = os.environ.get("SYNC_REACTIONS", "true").strip().lower()
+        self._sync_reactions: bool = sync_reactions_env not in ("0", "false", "no", "off")
+
         intents = discord.Intents.default()
         intents.message_content = True
         intents.messages = True
+        intents.reactions = True
         self.discord_bot = commands.Bot(command_prefix="!", intents=intents)
         self._setup_discord_handlers()
 
@@ -232,6 +237,10 @@ class MessageSyncBot:
                 if message.reference and message.reference.message_id
                 else None,
             )
+
+        @self.discord_bot.event
+        async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+            await self._handle_discord_reaction(payload)
 
         @self.discord_bot.event
         async def on_message_edit(before: discord.Message, after: discord.Message):
@@ -449,6 +458,8 @@ class MessageSyncBot:
                                 event.get("channel"), event.get("bot_id"))
                     if event.get("type") == "message":
                         await self._handle_slack_message(event)
+                    elif event.get("type") == "reaction_added":
+                        await self._handle_slack_reaction(event)
             except Exception:
                 logger.exception("Error in Slack socket handler")
 
@@ -584,6 +595,130 @@ class MessageSyncBot:
             block_image_urls=block_image_urls,
             discord_reply_to_id=discord_reply_to_id,
         )
+
+    async def _handle_slack_reaction(self, event: dict) -> None:
+        """Handle a Slack ``reaction_added`` event.
+
+        Finds the Discord message that corresponds to the Slack message that
+        received the reaction and posts a thread reply announcing who reacted
+        and with which emoji.  Does nothing when reaction sync is disabled
+        (``SYNC_REACTIONS=false``) or when the reacted message has no mapping.
+        """
+        if not self._sync_reactions:
+            return
+
+        item = event.get("item", {})
+        if item.get("type") != "message":
+            # Only handle reactions on messages (not files or other items).
+            return
+
+        slack_channel = item.get("channel")
+        slack_ts = item.get("ts")
+        user_id = event.get("user")
+        reaction = event.get("reaction", "")
+
+        if not slack_ts or not slack_channel:
+            return
+
+        discord_msg_id = self._msg_map_s2d.get(slack_ts)
+        if not discord_msg_id:
+            logger.debug("No Discord mapping for Slack message ts=%s — skipping reaction", slack_ts)
+            return
+
+        discord_channel_id = self.channel_mapping.get_discord_channel(slack_channel)
+        if not discord_channel_id:
+            return
+
+        # Resolve Slack user display name.
+        if user_id:
+            if user_id not in self._slack_user_cache:
+                try:
+                    info = await self.slack_client.users_info(user=user_id)
+                    profile = info["user"]["profile"]
+                    self._slack_user_cache[user_id] = (
+                        profile.get("display_name") or info["user"]["name"]
+                    )
+                except SlackApiError:
+                    self._slack_user_cache[user_id] = user_id
+            username = self._slack_user_cache[user_id]
+        else:
+            username = "unknown"
+
+        try:
+            channel = self.discord_bot.get_channel(int(discord_channel_id))
+            if not channel:
+                channel = await self.discord_bot.fetch_channel(int(discord_channel_id))
+
+            ref = discord.MessageReference(
+                message_id=discord_msg_id,
+                channel_id=int(discord_channel_id),
+                fail_if_not_exists=False,
+            )
+            await channel.send(
+                f":{reaction}: reaction added by @{username}",
+                reference=ref,
+            )
+            logger.info(
+                "Forwarded Slack reaction :%s: by %s to Discord message %s",
+                reaction, username, discord_msg_id,
+            )
+        except discord.errors.DiscordException as e:
+            logger.error("Failed to post Slack reaction to Discord: %s", e)
+
+    async def _handle_discord_reaction(self, payload: discord.RawReactionActionEvent) -> None:
+        """Handle a Discord ``on_raw_reaction_add`` event.
+
+        Finds the Slack message that corresponds to the Discord message and
+        posts a thread reply announcing who reacted and with which emoji.
+        Does nothing when reaction sync is disabled (``SYNC_REACTIONS=false``)
+        or when the reacted message has no mapping.
+        """
+        if not self._sync_reactions:
+            return
+
+        # Ignore reactions added by the bot itself.
+        if self.discord_bot.user and payload.user_id == self.discord_bot.user.id:
+            return
+
+        slack_ts = self._msg_map_d2s.get(payload.message_id)
+        if not slack_ts:
+            logger.debug(
+                "No Slack mapping for Discord message %s — skipping reaction",
+                payload.message_id,
+            )
+            return
+
+        slack_channel = self.channel_mapping.get_slack_channel(str(payload.channel_id))
+        if not slack_channel:
+            return
+
+        # Resolve Discord display name.
+        username: str = str(payload.user_id)
+        if payload.guild_id:
+            guild = self.discord_bot.get_guild(payload.guild_id)
+            if guild:
+                member = guild.get_member(payload.user_id)
+                if member:
+                    username = member.display_name
+        if username == str(payload.user_id):
+            user = self.discord_bot.get_user(payload.user_id)
+            if user:
+                username = user.display_name
+
+        emoji_str = str(payload.emoji)
+
+        try:
+            await self.slack_client.chat_postMessage(
+                channel=slack_channel,
+                text=f"{emoji_str} reaction added by @{username}",
+                thread_ts=slack_ts,
+            )
+            logger.info(
+                "Forwarded Discord reaction %s by %s to Slack message ts=%s",
+                emoji_str, username, slack_ts,
+            )
+        except SlackApiError as e:
+            logger.error("Failed to post Discord reaction to Slack: %s", e)
 
     async def _send_to_slack(
         self, channel_id: str, username: str, text: str, discord_msg_id: int,
