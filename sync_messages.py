@@ -243,6 +243,10 @@ class MessageSyncBot:
             await self._handle_discord_reaction(payload)
 
         @self.discord_bot.event
+        async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+            await self._handle_discord_message_delete(payload)
+
+        @self.discord_bot.event
         async def on_message_edit(before: discord.Message, after: discord.Message):
             # Only process if we forwarded the original message.
             slack_ts = self._msg_map_d2s.get(after.id)
@@ -505,11 +509,28 @@ class MessageSyncBot:
             logger.info("Skipping: message from our own bot (bot_id=%s)", bot_id)
             return
 
-        # Allow file_share, bot_message, and message_changed (for bot image posts).
-        # Skip everything else (message_deleted, channel_join, huddle, etc.).
-        allowed_subtypes = ("file_share", "bot_message", "message_changed")
+        # Allow file_share, bot_message, message_changed, and message_deleted.
+        # Skip everything else (channel_join, huddle, etc.).
+        allowed_subtypes = ("file_share", "bot_message", "message_changed", "message_deleted")
         if subtype and subtype not in allowed_subtypes:
             logger.info("Skipping: unhandled subtype=%s", subtype)
+            return
+
+        # message_deleted: remove the forwarded Discord message if we have a mapping.
+        if subtype == "message_deleted":
+            deleted_ts = event.get("deleted_ts")
+            discord_msg_id = self._msg_map_s2d.get(deleted_ts) if deleted_ts else None
+            if discord_msg_id:
+                ch_id = event.get("channel")
+                d_ch_id = self.channel_mapping.get_discord_channel(ch_id) if ch_id else None
+                if d_ch_id:
+                    await self._delete_discord_message(d_ch_id, discord_msg_id, deleted_ts)
+                else:
+                    logger.warning(
+                        "Skipping: message_deleted — no Discord channel mapping for Slack channel %s", ch_id
+                    )
+            else:
+                logger.info("Skipping: message_deleted with no mapping for ts=%s", deleted_ts)
             return
 
         # message_changed: if we forwarded the original, edit it on Discord.
@@ -595,6 +616,84 @@ class MessageSyncBot:
             block_image_urls=block_image_urls,
             discord_reply_to_id=discord_reply_to_id,
         )
+
+    async def _delete_discord_message(
+        self, channel_id: str, message_id: int, slack_ts: str
+    ) -> None:
+        """Delete a Discord message that was originally forwarded from Slack.
+
+        Tries the cached webhook first (fastest, no extra API calls). Falls
+        back to fetching the message directly if the webhook is unavailable.
+        Cleans up both sides of the message map after a successful delete.
+        """
+        webhook = self._webhook_cache.get(channel_id)
+        if webhook:
+            try:
+                await webhook.delete_message(message_id)
+                logger.info(
+                    "Deleted Discord message %s for Slack delete ts=%s", message_id, slack_ts
+                )
+                self._msg_map_s2d.pop(slack_ts, None)
+                self._msg_map_d2s.pop(message_id, None)
+                self._save_msg_maps()
+                return
+            except discord.errors.DiscordException as e:
+                logger.warning(
+                    "Webhook delete failed for message %s: %s — trying direct delete",
+                    message_id, e,
+                )
+
+        # Fallback: fetch the message and delete it (works for bot-authored messages).
+        try:
+            channel = self.discord_bot.get_channel(int(channel_id))
+            if not channel:
+                channel = await self.discord_bot.fetch_channel(int(channel_id))
+            msg = await channel.fetch_message(message_id)
+            await msg.delete()
+            logger.info(
+                "Deleted Discord message %s for Slack delete ts=%s", message_id, slack_ts
+            )
+        except discord.errors.NotFound:
+            logger.info("Discord message %s was already deleted", message_id)
+        except discord.errors.DiscordException as e:
+            logger.error("Failed to delete Discord message %s: %s", message_id, e)
+        finally:
+            self._msg_map_s2d.pop(slack_ts, None)
+            self._msg_map_d2s.pop(message_id, None)
+            self._save_msg_maps()
+
+    async def _handle_discord_message_delete(
+        self, payload: discord.RawMessageDeleteEvent
+    ) -> None:
+        """Handle a Discord ``on_raw_message_delete`` event.
+
+        If the deleted message was previously forwarded to Slack, deletes the
+        corresponding Slack message and cleans up the message map.
+        """
+        slack_ts = self._msg_map_d2s.get(payload.message_id)
+        if not slack_ts:
+            logger.debug(
+                "No Slack mapping for deleted Discord message %s — skipping",
+                payload.message_id,
+            )
+            return
+
+        slack_channel = self.channel_mapping.get_slack_channel(str(payload.channel_id))
+        if not slack_channel:
+            return
+
+        try:
+            await self.slack_client.chat_delete(channel=slack_channel, ts=slack_ts)
+            logger.info(
+                "Deleted Slack message ts=%s for Discord delete %s",
+                slack_ts, payload.message_id,
+            )
+        except SlackApiError as e:
+            logger.error("Failed to delete Slack message ts=%s: %s", slack_ts, e)
+        finally:
+            self._msg_map_d2s.pop(payload.message_id, None)
+            self._msg_map_s2d.pop(slack_ts, None)
+            self._save_msg_maps()
 
     async def _handle_slack_reaction(self, event: dict) -> None:
         """Handle a Slack ``reaction_added`` event.

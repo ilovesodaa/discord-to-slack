@@ -157,6 +157,8 @@ The bot will:
 - Bot messages are automatically ignored to prevent loops
 - The sync is real-time and runs continuously until stopped (Ctrl+C)
 - Message history is not synced, only new messages after the bot starts
+- **Edit sync** — edits on either platform are mirrored to the other in real time
+- **Delete sync** — deleting a forwarded message on either platform also removes it from the other
 
 **Reaction Sync:**
 
@@ -223,6 +225,7 @@ To enable Slack → Discord reaction sync, subscribe to the `reaction_added` Sla
    - `message.channels` — messages in public channels
    - `message.groups` — messages in private channels
    - `reaction_added` — reactions added to messages (required for reaction sync)
+   - `message_deleted` events are delivered automatically as a subtype of `message.channels` / `message.groups` — no separate subscription needed
 6. Install/reinstall the app to your workspace
 7. Copy both the **Bot User OAuth Token** and the **App-Level Token**
 
