@@ -96,9 +96,14 @@ class MessageSyncBot:
         self.channel_mapping = ChannelMapping(mapping_path)
 
         # Initialize Discord bot
+        # Reaction sync: set to False to disable reaction announcements entirely.
+        sync_reactions_env = os.environ.get("SYNC_REACTIONS", "true").strip().lower()
+        self._sync_reactions: bool = sync_reactions_env not in ("0", "false", "no", "off")
+
         intents = discord.Intents.default()
         intents.message_content = True
         intents.messages = True
+        intents.reactions = True
         self.discord_bot = commands.Bot(command_prefix="!", intents=intents)
         self._setup_discord_handlers()
 
@@ -232,6 +237,14 @@ class MessageSyncBot:
                 if message.reference and message.reference.message_id
                 else None,
             )
+
+        @self.discord_bot.event
+        async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+            await self._handle_discord_reaction(payload)
+
+        @self.discord_bot.event
+        async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+            await self._handle_discord_message_delete(payload)
 
         @self.discord_bot.event
         async def on_message_edit(before: discord.Message, after: discord.Message):
@@ -449,6 +462,8 @@ class MessageSyncBot:
                                 event.get("channel"), event.get("bot_id"))
                     if event.get("type") == "message":
                         await self._handle_slack_message(event)
+                    elif event.get("type") == "reaction_added":
+                        await self._handle_slack_reaction(event)
             except Exception:
                 logger.exception("Error in Slack socket handler")
 
@@ -494,11 +509,28 @@ class MessageSyncBot:
             logger.info("Skipping: message from our own bot (bot_id=%s)", bot_id)
             return
 
-        # Allow file_share, bot_message, and message_changed (for bot image posts).
-        # Skip everything else (message_deleted, channel_join, huddle, etc.).
-        allowed_subtypes = ("file_share", "bot_message", "message_changed")
+        # Allow file_share, bot_message, message_changed, and message_deleted.
+        # Skip everything else (channel_join, huddle, etc.).
+        allowed_subtypes = ("file_share", "bot_message", "message_changed", "message_deleted")
         if subtype and subtype not in allowed_subtypes:
             logger.info("Skipping: unhandled subtype=%s", subtype)
+            return
+
+        # message_deleted: remove the forwarded Discord message if we have a mapping.
+        if subtype == "message_deleted":
+            deleted_ts = event.get("deleted_ts")
+            discord_msg_id = self._msg_map_s2d.get(deleted_ts) if deleted_ts else None
+            if discord_msg_id:
+                ch_id = event.get("channel")
+                d_ch_id = self.channel_mapping.get_discord_channel(ch_id) if ch_id else None
+                if d_ch_id:
+                    await self._delete_discord_message(d_ch_id, discord_msg_id, deleted_ts)
+                else:
+                    logger.warning(
+                        "Skipping: message_deleted — no Discord channel mapping for Slack channel %s", ch_id
+                    )
+            else:
+                logger.info("Skipping: message_deleted with no mapping for ts=%s", deleted_ts)
             return
 
         # message_changed: if we forwarded the original, edit it on Discord.
@@ -584,6 +616,208 @@ class MessageSyncBot:
             block_image_urls=block_image_urls,
             discord_reply_to_id=discord_reply_to_id,
         )
+
+    async def _delete_discord_message(
+        self, channel_id: str, message_id: int, slack_ts: str
+    ) -> None:
+        """Delete a Discord message that was originally forwarded from Slack.
+
+        Tries the cached webhook first (fastest, no extra API calls). Falls
+        back to fetching the message directly if the webhook is unavailable.
+        Cleans up both sides of the message map after a successful delete.
+        """
+        webhook = self._webhook_cache.get(channel_id)
+        if webhook:
+            try:
+                await webhook.delete_message(message_id)
+                logger.info(
+                    "Deleted Discord message %s for Slack delete ts=%s", message_id, slack_ts
+                )
+                self._msg_map_s2d.pop(slack_ts, None)
+                self._msg_map_d2s.pop(message_id, None)
+                self._save_msg_maps()
+                return
+            except discord.errors.DiscordException as e:
+                logger.warning(
+                    "Webhook delete failed for message %s: %s — trying direct delete",
+                    message_id, e,
+                )
+
+        # Fallback: fetch the message and delete it (works for bot-authored messages).
+        try:
+            channel = self.discord_bot.get_channel(int(channel_id))
+            if not channel:
+                channel = await self.discord_bot.fetch_channel(int(channel_id))
+            msg = await channel.fetch_message(message_id)
+            await msg.delete()
+            logger.info(
+                "Deleted Discord message %s for Slack delete ts=%s", message_id, slack_ts
+            )
+        except discord.errors.NotFound:
+            logger.info("Discord message %s was already deleted", message_id)
+        except discord.errors.DiscordException as e:
+            logger.error("Failed to delete Discord message %s: %s", message_id, e)
+        finally:
+            self._msg_map_s2d.pop(slack_ts, None)
+            self._msg_map_d2s.pop(message_id, None)
+            self._save_msg_maps()
+
+    async def _handle_discord_message_delete(
+        self, payload: discord.RawMessageDeleteEvent
+    ) -> None:
+        """Handle a Discord ``on_raw_message_delete`` event.
+
+        If the deleted message was previously forwarded to Slack, deletes the
+        corresponding Slack message and cleans up the message map.
+        """
+        slack_ts = self._msg_map_d2s.get(payload.message_id)
+        if not slack_ts:
+            logger.debug(
+                "No Slack mapping for deleted Discord message %s — skipping",
+                payload.message_id,
+            )
+            return
+
+        slack_channel = self.channel_mapping.get_slack_channel(str(payload.channel_id))
+        if not slack_channel:
+            return
+
+        try:
+            await self.slack_client.chat_delete(channel=slack_channel, ts=slack_ts)
+            logger.info(
+                "Deleted Slack message ts=%s for Discord delete %s",
+                slack_ts, payload.message_id,
+            )
+        except SlackApiError as e:
+            logger.error("Failed to delete Slack message ts=%s: %s", slack_ts, e)
+        finally:
+            self._msg_map_d2s.pop(payload.message_id, None)
+            self._msg_map_s2d.pop(slack_ts, None)
+            self._save_msg_maps()
+
+    async def _handle_slack_reaction(self, event: dict) -> None:
+        """Handle a Slack ``reaction_added`` event.
+
+        Finds the Discord message that corresponds to the Slack message that
+        received the reaction and posts a thread reply announcing who reacted
+        and with which emoji.  Does nothing when reaction sync is disabled
+        (``SYNC_REACTIONS=false``) or when the reacted message has no mapping.
+        """
+        if not self._sync_reactions:
+            return
+
+        item = event.get("item", {})
+        if item.get("type") != "message":
+            # Only handle reactions on messages (not files or other items).
+            return
+
+        slack_channel = item.get("channel")
+        slack_ts = item.get("ts")
+        user_id = event.get("user")
+        reaction = event.get("reaction", "")
+
+        if not slack_ts or not slack_channel:
+            return
+
+        discord_msg_id = self._msg_map_s2d.get(slack_ts)
+        if not discord_msg_id:
+            logger.debug("No Discord mapping for Slack message ts=%s — skipping reaction", slack_ts)
+            return
+
+        discord_channel_id = self.channel_mapping.get_discord_channel(slack_channel)
+        if not discord_channel_id:
+            return
+
+        # Resolve Slack user display name.
+        if user_id:
+            if user_id not in self._slack_user_cache:
+                try:
+                    info = await self.slack_client.users_info(user=user_id)
+                    profile = info["user"]["profile"]
+                    self._slack_user_cache[user_id] = (
+                        profile.get("display_name") or info["user"]["name"]
+                    )
+                except SlackApiError:
+                    self._slack_user_cache[user_id] = user_id
+            username = self._slack_user_cache[user_id]
+        else:
+            username = "unknown"
+
+        try:
+            channel = self.discord_bot.get_channel(int(discord_channel_id))
+            if not channel:
+                channel = await self.discord_bot.fetch_channel(int(discord_channel_id))
+
+            ref = discord.MessageReference(
+                message_id=discord_msg_id,
+                channel_id=int(discord_channel_id),
+                fail_if_not_exists=False,
+            )
+            await channel.send(
+                f":{reaction}: reaction added by @{username}",
+                reference=ref,
+            )
+            logger.info(
+                "Forwarded Slack reaction :%s: by %s to Discord message %s",
+                reaction, username, discord_msg_id,
+            )
+        except discord.errors.DiscordException as e:
+            logger.error("Failed to post Slack reaction to Discord: %s", e)
+
+    async def _handle_discord_reaction(self, payload: discord.RawReactionActionEvent) -> None:
+        """Handle a Discord ``on_raw_reaction_add`` event.
+
+        Finds the Slack message that corresponds to the Discord message and
+        posts a thread reply announcing who reacted and with which emoji.
+        Does nothing when reaction sync is disabled (``SYNC_REACTIONS=false``)
+        or when the reacted message has no mapping.
+        """
+        if not self._sync_reactions:
+            return
+
+        # Ignore reactions added by the bot itself.
+        if self.discord_bot.user and payload.user_id == self.discord_bot.user.id:
+            return
+
+        slack_ts = self._msg_map_d2s.get(payload.message_id)
+        if not slack_ts:
+            logger.debug(
+                "No Slack mapping for Discord message %s — skipping reaction",
+                payload.message_id,
+            )
+            return
+
+        slack_channel = self.channel_mapping.get_slack_channel(str(payload.channel_id))
+        if not slack_channel:
+            return
+
+        # Resolve Discord display name.
+        username: str = str(payload.user_id)
+        if payload.guild_id:
+            guild = self.discord_bot.get_guild(payload.guild_id)
+            if guild:
+                member = guild.get_member(payload.user_id)
+                if member:
+                    username = member.display_name
+        if username == str(payload.user_id):
+            user = self.discord_bot.get_user(payload.user_id)
+            if user:
+                username = user.display_name
+
+        emoji_str = str(payload.emoji)
+
+        try:
+            await self.slack_client.chat_postMessage(
+                channel=slack_channel,
+                text=f"{emoji_str} reaction added by @{username}",
+                thread_ts=slack_ts,
+            )
+            logger.info(
+                "Forwarded Discord reaction %s by %s to Slack message ts=%s",
+                emoji_str, username, slack_ts,
+            )
+        except SlackApiError as e:
+            logger.error("Failed to post Discord reaction to Slack: %s", e)
 
     async def _send_to_slack(
         self, channel_id: str, username: str, text: str, discord_msg_id: int,
